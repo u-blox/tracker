@@ -1,0 +1,9 @@
+{
+    "eventName": "telemetry",
+    "url": "https://cc2016api-testing.azurewebsites.net/api/geotracking/test",
+    "requestType": "PUT",
+    "headers": {"Authorization": "Basic OmJlMzcyNTNiLTFhZDYtNGUzMy1hNDA3LTVhNTMzNWZmOGZiMg=="},
+    "json": {"telemetry": "{{PARTICLE_EVENT_VALUE}}"},
+    "mydevices": true,
+    "noDefaults": true
+}
