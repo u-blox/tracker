@@ -3,5 +3,5 @@
   "author": "Rob Meades <rob-meades@u-blox.com>",
   "license": "Apache",
   "version": "0.0.1",
-  "description": "A library that publishes position using a Particle [Electron] board, a PAM-7Q module and an ADXL345 break-out board."
+  "description": "A library that publishes position using a Particle [Electron] board, a PAM-7Q module and an ADXL345 break-out board (this latter used to save power)."
 }
