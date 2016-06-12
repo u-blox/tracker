@@ -1,57 +1,47 @@
 #include "accelerometer.h"
 
 #define ACCELEROMETER_ADDRESS   ((uint8_t) 0x53)
-#define ACCELEROMETER_INT_ENABLE_REG_VALUE 0x54   // Enable the activity, single-tap and free-fall interrupts
+#define ACCELEROMETER_INT_ENABLE_REG_VALUE 0x70   // Enable the activity, single-tap and double-tap interrupts
 
 // ----------------------------------------------------------------
 // INTERRUPT HANDLER
 // ----------------------------------------------------------------
 
-#if 0
-// Handle for ourselves to allow interrupt function to work
-static Accelerometer * gAccelerometer = NULL;
-
 /// Interrupt handler for the accelerometer
-void intAccelerometer(void)
+Accelerometer::EventsBitmap_t Accelerometer::handleInterrupt(void)
 {
-    char data[2];
-
-    gAccelerometer->pAccelerometerInt->disable_irq();
-
-    // Don't ask me why but this interrupt only works reliably with the
-    // ADXL345 chip when this LED flash (or, presumably, an equivalent
-    // delay) is inserted.
-    //doFlash(1);
-
-    gEventsBitmap = (Accelerometer::EventsBitmap_t) (gEventsBitmap | SensorsHandler::EVENT_MOTION);
+    Accelerometer::EventsBitmap_t eventsBitmap = Accelerometer::EVENT_NONE;
+    char eventReg;
 
     // Read what happened
-    data[0] = 0x30;
-    data[1] = 0x00;
-    gAccelerometer->pI2c->write(ACCELEROMETER_ADDRESS, &(data[0]), 1);
-    gAccelerometer->pI2c->read(ACCELEROMETER_ADDRESS, &(data[1]), 1);
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    Wire.write(0x30);
+    Wire.endTransmission(true);
 
-    // Activity
-    if (data[1] & 0x10)
-    {
-        gEventsBitmap = (Accelerometer::EventsBitmap_t) (gEventsBitmap | SensorsHandler::EVENT_MOTION_NUDGE);
+    if (Wire.requestFrom(ACCELEROMETER_ADDRESS, (uint8_t) 1) == 1) {
+        eventReg = Wire.read();
+
+        // Activity
+        if (eventReg & 0x10)
+        {
+            eventsBitmap = (Accelerometer::EventsBitmap_t) (eventsBitmap | Accelerometer::EVENT_ACTIVITY);
+        }
+    
+        // Double tap
+        if (eventReg & 0x20)
+        {
+            eventsBitmap = (Accelerometer::EventsBitmap_t) (eventsBitmap | Accelerometer::EVENT_DOUBLE_TAP);
+        }
+    
+        // Single tap
+        if (eventReg & 0x40)
+        {
+            eventsBitmap = (Accelerometer::EventsBitmap_t) (eventsBitmap | Accelerometer::EVENT_SINGLE_TAP);
+        }
     }
-
-    // Single tap
-    if (data[1] & 0x40)
-    {
-        gEventsBitmap = (Accelerometer::EventsBitmap_t) (gEventsBitmap | SensorsHandler::EVENT_MOTION_SLAP);
-    }
-
-    // Free-fall
-    if (data[1] & 0x04)
-    {
-        gEventsBitmap = (Accelerometer::EventsBitmap_t) (gEventsBitmap | SensorsHandler::EVENT_MOTION_DROPPED);
-    }
-
-    gAccelerometer->pAccelerometerInt->enable_irq();
+    
+    return eventsBitmap;
 }
-#endif
 
 // ----------------------------------------------------------------
 // GENERIC PRIVATE FUNCTIONS
@@ -106,20 +96,9 @@ bool Accelerometer::begin(void)
     bool success = false;
     uint8_t data[2];
 
-    // D2 high (connected to CS bar,
-    // and going high puts the chip into
-    // I2C mode)
-    pinMode(D2, OUTPUT);
-    digitalWrite(D2, HIGH);
-
-    // D3 is an interrupt input (INT1)
-    pinMode(D3, INPUT);
-
     // Start the I2C interface
     Wire.setSpeed(CLOCK_SPEED_100KHZ);
     Wire.begin();
-
-    // TODO set up interrupt
 
     // Setup the ADI XL345 accelerometer
     // Reading register 0x00 should get us back 0xE5
@@ -129,9 +108,10 @@ bool Accelerometer::begin(void)
     if (bytesWritten == 1) {
         if (Wire.requestFrom(ACCELEROMETER_ADDRESS, (uint8_t) 1) == 1) {
             data[0] = Wire.read();
-            if (data[0] == 0xE5)
-            {
+            if (data[0] == 0xE5) {
                 success = true;
+                
+                Serial.printf("Accelerometer is connected at I2C address 0x%02x.\n", ACCELEROMETER_ADDRESS);
                 
                 // Set up the interrupts: activity, single-tap and
                 // free-fall
@@ -147,8 +127,8 @@ bool Accelerometer::begin(void)
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
 
-                data[0] = 0x24;  // Activity threshold (== nudge)
-                data[1] = 0x18;  // Quite low
+                data[0] = 0x24;  // Activity threshold
+                data[1] = 0x18;  // Low
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);
@@ -158,7 +138,6 @@ bool Accelerometer::begin(void)
                     Serial.printf("Accelerometer: I2C address 0x%02x, unable to set activity threshold register (0x%02x) to value 0x%02x.\n",
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
-
 
                 data[0] = 0x27;  // Activity/inactivity control
                 data[1] = 0x70;  // Fixed comparison, all axes participating
@@ -172,8 +151,8 @@ bool Accelerometer::begin(void)
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
 
-                data[0] = 0x1D;  // Single-tap threshold (== slap)
-                data[1] = 0xC0;  // Quite high
+                data[0] = 0x1D;  // Single-tap threshold
+                data[1] = 0x18;  // Low
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);
@@ -205,30 +184,6 @@ bool Accelerometer::begin(void)
                 if (bytesWritten != 2) {
                     success = false;
                     Serial.printf("Accelerometer: I2C address 0x%02x, unable to set tap axes involvement register (0x%02x) to value 0x%02x.\n",
-                                  ACCELEROMETER_ADDRESS, data[0], data[1]);
-                }
-
-                data[0] = 0x28;  // Free-fall threshold (== dropped)
-                data[1] = 0x05;  // A low value
-                Wire.beginTransmission(ACCELEROMETER_ADDRESS);
-                bytesWritten = Wire.write(data, 2);
-                Wire.endTransmission(true);
-
-                if (bytesWritten != 2) {
-                    success = false;
-                    Serial.printf("Accelerometer: I2C address 0x%02x, unable to set free-fall threshold register (0x%02x) to value 0x%02x.\n",
-                                  ACCELEROMETER_ADDRESS, data[0], data[1]);
-                }
-
-                data[0] = 0x29;  // Duration of free fall in 5 ms units
-                data[1] = 0x14;  // A low value
-                Wire.beginTransmission(ACCELEROMETER_ADDRESS);
-                bytesWritten = Wire.write(data, 2);
-                Wire.endTransmission(true);
-            
-                if (bytesWritten != 2) {
-                    success = false;
-                    Serial.printf("Accelerometer: I2C address 0x%02x, unable to set duration of free fall register (0x%02x) to value 0x%02x.\n",
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
 
@@ -268,6 +223,9 @@ bool Accelerometer::begin(void)
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
 
+                // Call this just to clear any interrupts
+                handleInterrupt();
+                
                 success = true;
             
             } else {
@@ -279,12 +237,12 @@ bool Accelerometer::begin(void)
                           ACCELEROMETER_ADDRESS, data[0]);
         }
     } else {
-        Serial.printf("Accelerometer: I2C address 0x%02x, unable to write address of register 0x%02x.\n",
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to write the address of register 0x%02x.\n",
                       ACCELEROMETER_ADDRESS, data[0]);
     }
 
     // For debug purposes
-    readDeviceRegisters(ACCELEROMETER_ADDRESS, 0x1D, 30);
+    //readDeviceRegisters(ACCELEROMETER_ADDRESS, 0x1D, 30);
 
     return success;
 }
