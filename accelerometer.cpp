@@ -128,7 +128,7 @@ bool Accelerometer::begin(void)
                 }
 
                 data[0] = 0x24;  // Activity threshold
-                data[1] = 0x18;  // Low
+                data[1] = 0x10;  // Low
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);
@@ -140,7 +140,7 @@ bool Accelerometer::begin(void)
                 }
 
                 data[0] = 0x27;  // Activity/inactivity control
-                data[1] = 0x70;  // Fixed comparison, all axes participating
+                data[1] = 0xF0;  // Compare changes, all axes participating
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);
@@ -152,7 +152,7 @@ bool Accelerometer::begin(void)
                 }
 
                 data[0] = 0x1D;  // Single-tap threshold
-                data[1] = 0x18;  // Low
+                data[1] = 0x4F;  // Middling
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);
@@ -265,8 +265,7 @@ bool Accelerometer::read(int16_t *pX, int16_t *pY, int16_t *pZ)
 
     if (numBytes != 2) {
         success = false;
-        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set power control register (0x%02x) to value 0x%02x.\n",
-                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set power control register (0x%02x) to value 0x%02x.\n", ACCELEROMETER_ADDRESS, data[0], data[1]);
     }
 
     delay(10);
@@ -287,8 +286,7 @@ bool Accelerometer::read(int16_t *pX, int16_t *pY, int16_t *pZ)
         }
     } else {
         success = false;
-        Serial.printf("Accelerometer: I2C address 0x%02x, only able to read %d out of the six data registers.\n",
-                      ACCELEROMETER_ADDRESS, numBytes);
+        Serial.printf("Accelerometer: I2C address 0x%02x, only able to read %d out of the six data registers.\n", ACCELEROMETER_ADDRESS, numBytes);
     }
     
     x = data[0] + ((int16_t) data[1] << 8);

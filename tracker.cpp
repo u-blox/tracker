@@ -167,6 +167,13 @@
  * TYPES
  ***************************************************************/
 
+// Struct to hold an accelerometer reading
+typedef struct {
+    int16_t x;
+    int16_t y;
+    int16_t z;
+} AccelerometerReading_t;
+
 // The possible record types
 typedef enum {
     RECORD_TYPE_NULL,
@@ -184,11 +191,10 @@ typedef struct {
 
 // For debugging: LED flash types
 typedef enum {
-    DEBUG_IND_NULL,
+    DEBUG_IND_OFF,
+    DEBUG_IND_TOGGLE,
     DEBUG_IND_GPS_FIX,
     DEBUG_IND_ACTIVITY,
-    DEBUG_IND_SINGLE_TAP,
-    DEBUG_IND_DOUBLE_TAP,
     MAX_NUM_DEBUG_INDS
 } DebugInd_t;
 
@@ -253,6 +259,25 @@ volatile bool intFlag = false;
 // Boolean to flag that we're moving
 bool inMotion = true;
 
+// Count the number of times around the loop, for info
+uint32_t numLoops = 0;
+
+// Count the number of loops for which a GPS fix was attempted, for info
+uint32_t numLoopsGpsRunning = 0;
+
+// Count the number of loops for which a GPS fix was achieved, for info
+uint32_t numLoopsGpsFix = 0;
+
+// Count the number of seconds we've been asleep for
+uint32_t totalSleepSeconds = 0;
+
+// Count the number of seconds GPS has been on for
+time_t gpsPowerOnTime = 0;
+uint32_t totalGpsSeconds = 0;
+
+// Hold the last accelerometer reading
+AccelerometerReading_t accelerometerReading;
+
 // Instantiate GPS
 TinyGPS gps;
 
@@ -281,6 +306,7 @@ static uint8_t incModRecords (uint8_t x);
 static time_t gpsOn();
 static void gpsOff();
 static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude);
+static void updateTotalGpsSeconds();
 static void connect();
 static bool establishTime();
 static char * getRecord(RecordType_t type);
@@ -295,15 +321,16 @@ static void queueGpsReport(float latitude, float longitude);
 static void intPinOccurred() {
     // No bandwidth to do anything here, just flag it
     intFlag = true;
-    debugInd(DEBUG_IND_NULL);
+    debugInd(DEBUG_IND_TOGGLE);
 }
 
-// Attach the accelerometer interrupt to the given pin
+// Attach the intPinOccurred() interrupt function to the given pin
 static bool attachInterrupt(int pin) {
     bool success = false;
     
-    if (attachInterrupt(pin, handleInterrupt, RISING)) {
+    if (attachInterrupt(pin, intPinOccurred, RISING)) {
         success = true;
+        Serial.printf ("Interrupt attached to pin %d.\n", pin);
     } else {
         Serial.println ("WARNING: couldn't attach interrupt to pin.");
     }
@@ -311,28 +338,23 @@ static bool attachInterrupt(int pin) {
     return success;
 }
 
-// Handle the accelerometer interrupt
+// Handle the accelerometer interrupt, though do NOT call this from
+// an interrupt context as it does too much
 static void handleInterrupt() {
     Accelerometer::EventsBitmap_t eventsBitmap;
     
     // Disable interrupts
     noInterrupts();
+    accelerometer.read (&accelerometerReading.x, &accelerometerReading.y, &accelerometerReading.z);
     eventsBitmap = accelerometer.handleInterrupt();
     // Re-enable interrupts
     interrupts();
-    
-    debugInd(DEBUG_IND_NULL);
     
     // Flag if we're in motion and switch GPS
     // on to get a fix
     if (eventsBitmap & Accelerometer::EVENT_ACTIVITY) {
         inMotion = true;
-    }
-    
-    // Force transmission of a report if there's been a
-    // double-tap
-    if (eventsBitmap & Accelerometer::EVENT_DOUBLE_TAP) {
-        forceSend = true;
+        debugInd(DEBUG_IND_ACTIVITY);
     }
 }
 
@@ -353,45 +375,28 @@ static int getImeiCallBack(int type, const char* pBuf, int len, char* imei) {
 static void debugInd(DebugInd_t debugInd) {
     
     switch (debugInd) {
-        case DEBUG_IND_NULL:
+        case DEBUG_IND_OFF:
+            digitalWrite(D7, LOW);
+        break;
+        case DEBUG_IND_TOGGLE:
             // This one is the lowest-cost debug option
             digitalWrite(D7, !(digitalRead(D7)));
         break;
         case DEBUG_IND_GPS_FIX:
+            digitalWrite(D7, LOW);
+            delay (25);
             digitalWrite(D7, HIGH);
             delay (25);
             digitalWrite(D7, LOW);
-            delay (100);
+            delay (25);
         break;
         case DEBUG_IND_ACTIVITY:
+            digitalWrite(D7, LOW);
+            delay (25);
             digitalWrite(D7, HIGH);
             delay (100);
             digitalWrite(D7, LOW);
-            delay (100);
-        break;
-        case DEBUG_IND_SINGLE_TAP:
-            digitalWrite(D7, HIGH);
-            delay (50);
-            digitalWrite(D7, LOW);
-            delay (50);
-            digitalWrite(D7, HIGH);
-            delay (50);
-            digitalWrite(D7, LOW);
-            delay (100);
-        break;
-        case DEBUG_IND_DOUBLE_TAP:
-            digitalWrite(D7, HIGH);
-            delay (50);
-            digitalWrite(D7, LOW);
-            delay (50);
-            digitalWrite(D7, HIGH);
-            delay (50);
-            digitalWrite(D7, LOW);
-            delay (50);
-            digitalWrite(D7, HIGH);
-            delay (50);
-            digitalWrite(D7, LOW);
-            delay (100);
+            delay (25);
         break;
         default:
         break;
@@ -412,6 +417,10 @@ static uint8_t incModRecords (uint8_t x) {
 // Switch GPS on, returning the time that
 // GPS was switched on
 static time_t gpsOn() {
+    // If it's already on, total up the time
+    if (!digitalRead(D2)) {
+        gpsPowerOnTime = Time.now();
+    }
     digitalWrite(D2, HIGH);
     
     return Time.now();
@@ -419,7 +428,10 @@ static time_t gpsOn() {
 
 // Switch GPS off
 static void gpsOff() {
-    digitalWrite(D2, LOW);
+    if (digitalRead(D2)) {
+        digitalWrite(D2, LOW);
+        updateTotalGpsSeconds();
+    }
 }
 
 // Update the GPS, making sure it's been on for
@@ -434,7 +446,7 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
     float latitude;
     float longitude;
 
-    Serial.printf("Checking for GPS fix for up to %d seconds:\n", GPS_FIX_TIME_SECONDS);
+    Serial.printf("Checking for GPS fix for up to %d second(s):\n", GPS_FIX_TIME_SECONDS);
 
     // Make sure GPS is switched on
     gpsOn();
@@ -479,6 +491,9 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
         Serial.printf("No fix yet.\n");
     }
     
+    // Update the stats
+    updateTotalGpsSeconds();
+
 #ifndef DISABLE_GPS_POWER_SAVING
     // If GPS has achieved a fix, switch it off
     if (fixAchieved) {
@@ -487,6 +502,20 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
 #endif
     
     return fixAchieved;
+}
+
+// Keep track of some stats for info
+static void updateTotalGpsSeconds() {
+    uint32_t x = Time.now() - gpsPowerOnTime;
+    
+    // Ignore silly values which could result if
+    // the timebase underneath us is update between
+    // gpsPowerOnTime and now
+    if (x < 31536000) {
+        totalGpsSeconds += x;
+    }
+    
+    gpsPowerOnTime = Time.now();
 }
 
 // Connect to the network
@@ -509,7 +538,7 @@ static bool establishTime() {
     bool success = false;
     
     if (Time.now() < MIN_TIME_UNIX_UTC) {
-        Serial.printf("Syncing time (this will take %d seconds).\n", TIME_SYNC_WAIT_SECONDS);
+        Serial.printf("Syncing time (this will take %d second(s)).\n", TIME_SYNC_WAIT_SECONDS);
         connect();
         Particle.syncTime();
         delay(TIME_SYNC_WAIT_SECONDS * 1000);
@@ -615,7 +644,7 @@ static void queueGpsReport(float latitude, float longitude) {
         Serial.println("WARNING: couldn't fit timestamp into report.");
     }
     
-    Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    Serial.printf ("%d byte(s) of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /****************************************************************
@@ -636,14 +665,16 @@ void setup() {
     pinMode(D3, OUTPUT);
     digitalWrite (D3, LOW);
     
-    // Set D7 to be an output (for the LED on the Particle board)
+    // Set D7 to be an output (for the debug LED on the
+    // Particle board) and switch it off
     pinMode(D7, OUTPUT);
-    digitalWrite (D7, LOW);
-    
+    debugInd(DEBUG_IND_OFF);
+
     // Set D2 to be an output (driving power to the GPS module)
     // and set it to ON to allow GPS position to be established
     // while we do everything else
     pinMode(D2, OUTPUT);
+    digitalWrite (D2, LOW);
     gpsOn();
 
     // After a reset of the Electron board it takes a Windows PC several seconds
@@ -655,7 +686,8 @@ void setup() {
     connect();
     establishTime();
 
-   // Set up all the necessary accelerometer bits
+    // Set up all the necessary accelerometer bits
+    memset (&accelerometerReading, 0, sizeof (accelerometerReading));
     accelerometer.begin();
 
     // Start the serial port for the GPS module
@@ -678,9 +710,23 @@ void loop() {
     bool inTheWorkingDay = false;
     time_t gpsOnTime = 0;
 
+    // This only for info
+    numLoops++;
+    
+    // Deal with the interrupt here, nice and calm, out of interrupt context
+    // NOTE: always read it, irrespective of the flag, as if we happened
+    // to miss the interrupt for some reason we'd get stuck if we didn't
+    // handle it (which is also the thing that clears it)
+    handleInterrupt();
+
     if (!firstTime) {
-        // Switch GPS on here so that it can get fixing.
-        gpsOnTime = gpsOn();
+#ifdef DISABLE_ACCELEROMETER
+        inMotion = true;
+#endif
+        // Switch GPS on early so that it can get fixing.
+        if (inMotion && (Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
+            gpsOnTime = gpsOn();
+        }
         
         // It seems counterintuitive to add a delay here but, if you don't
         // then, on wake-up from sleep, one or other of the calls below
@@ -689,12 +735,6 @@ void loop() {
         delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
     }
 
-    // Deal with the interrup here, nice and calm, out of interrupt context
-    if (intFlag) {
-        handleInterrupt();
-        intFlag = false;
-    }
-    
     // Having valid time is fundamental to this program and so, if time
     // has not been established (via a connection to the Particle server),
     // try to establish it again
@@ -713,13 +753,14 @@ void loop() {
                 inTheWorkingDay = true;
 
                 if (firstTime || (Time.now() >= sleepTime + WAKEUP_PERIOD_SECONDS)) {
-                    Serial.printf("Time now %d (UTC), been asleep since %d (%d seconds ago).\n", Time.now(), sleepTime,  Time.now() - sleepTime);
-                    
+                    Serial.printf("\nAwake: time now is %s UTC, slept since %s UTC (%d second(s) ago).\n",
+                                  Time.timeStr().c_str(), Time.timeStr(sleepTime).c_str(), Time.now() - sleepTime);
+                                  
                     sleepForSeconds = WAKEUP_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                     
                     // I have seen IMEI retrieval fail so check again here
                     if (imei[0] < '0') {
-                        Serial.println("Trying to get IMEI again...");
+                        Serial.println("WARNING: trying to get IMEI again...");
                         Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
                     }
                 
@@ -731,14 +772,12 @@ void loop() {
                         forceSend = true;
                     }
                     
-#ifdef DISABLE_ACCELEROMETER
-                    inMotion = true;
-#endif
                     // Queue a GPS report, if required
                     if ((Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
                         // If we've moved, take a new reading
                         if (inMotion) {
-                            Serial.println ("Motion was detected, getting latest GPS reading.");
+                            numLoopsGpsRunning++;
+                            Serial.println ("*** Motion was detected, getting latest GPS reading.");
                             // Get the latest output from GPS
                             gpsUpdate(gpsOnTime, &lastLatitude, &lastLongitude);
                             // Reset the flag
@@ -750,6 +789,7 @@ void loop() {
                         if (true) {
 #endif
                         if ((lastLatitude != TinyGPS::GPS_INVALID_F_ANGLE) && (lastLongitude != TinyGPS::GPS_INVALID_F_ANGLE)) {
+                            numLoopsGpsFix++;
                             lastGpsSeconds = Time.now();
                             queueGpsReport(lastLatitude, lastLongitude);
                         }
@@ -762,7 +802,7 @@ void loop() {
                         uint8_t x;
                 
                         if (forceSend) {
-                            Serial.println ("forceSend was set.");
+                            Serial.println ("Force Send was set.");
                         }
                         forceSend = false;
                         
@@ -805,7 +845,7 @@ void loop() {
                             
                         } while (x != incModRecords(currentRecord));
                         
-                        Serial.printf("%d reports sent, %d failed to send.\n", sentCount, failedCount);
+                        Serial.printf("%d report(s) sent, %d failed to send.\n", sentCount, failedCount);
                         // If there's been a publish failure and nextPubRecord is
                         // equal to currentRecord then we must have wrapped.  In this
                         // case, increment nextPubRecord to keep things in time order.
@@ -828,7 +868,7 @@ void loop() {
                     sleepForSeconds = Time.now() + START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                 }
                 if (sleepForSeconds > 0) {
-                    Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, work day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d seconds in order to wake up at %s.\n",
+                    Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d seconds in order to wake up at %s.\n",
                                   Time.hour(), Time.minute(), Time.second(),
                                   Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
                                   Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
@@ -842,7 +882,7 @@ void loop() {
             // We're awake when we shouldn't have started operation yet, calculate new wake-up time
             sleepForSeconds = START_TIME_UNIX_UTC - Time.now() - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
             if (sleepForSeconds > 0) {
-                Serial.printf("Awake too early (time now %s UTC, start time is %s UTC), going back to sleep for %d seconds in order to wake up at %s.\n",
+                Serial.printf("Awake too early (time now %s UTC, expected start time %s UTC), going back to sleep for %d second(s) in order to wake up at %s.\n",
                               Time.timeStr().c_str(), Time.timeStr(START_TIME_UNIX_UTC).c_str(), sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
                               Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
             } else {
@@ -854,43 +894,47 @@ void loop() {
         sleepForSeconds = TIME_SYNC_RETRY_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
     }
 
-    Serial.printf("Sleeping for %d seconds.\n", sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS);
+    // Print some stats
+    uint32_t x = millis() / 1000 + totalSleepSeconds;
+    if (x == 0) {
+        x = 1; // avoid div by 0
+    }
+    Serial.printf("Stats: up-time %d %d:%02d:%02d (since %s), of which %d%% was in power-save mode.\n",
+                  x / 86400, (x / 3600) % 24, (x / 60) % 60,  x % 60, Time.timeStr(Time.now() - x).c_str(), totalSleepSeconds * 100 / x);
+    Serial.printf("       GPS has been on for ~%d%% of the up-time.\n", totalGpsSeconds * 100 / x);
+    Serial.printf("       looped %d time(s), detected motion on %d loop(s) and obtained a GPS fix on %d (%d%%) of those loop(s).\n",
+                  numLoops, numLoopsGpsRunning, numLoopsGpsFix, (numLoopsGpsFix != 0) ? (numLoopsGpsRunning * 100 / numLoopsGpsFix) : 0);
+    Serial.printf("       last accelerometer reading: x = %d, y = %d, z = %d.\n", accelerometerReading.x, accelerometerReading.y, accelerometerReading.z);
+    Serial.printf("Loop %d: now sleeping for %d second(s) (will awake at %s UTC).\n",
+                  numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
+                  Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
 
+    // Make sure the debug LED is off to save power
+    debugInd(DEBUG_IND_OFF);
+    
     // Leave a little time for serial prints to leave the building before sleepy-byes
     delay (500);
 #ifdef DISABLE_WAKEUP_TIMES
     inTheWorkingDay = true;
 #endif
-    time_t wakeupTime = Time.now() + sleepForSeconds;
+    time_t downTime = Time.now();
+    // Now go to sleep for the allotted time.  If the accelerometer interrupts goes
+    // off it will be flagged and dealt with when we're good and ready, hence we sleep
+    // listening to a pin that is an output and always low.
+    // NOTE: I originally had the "inTheWorkingDay" code waking up on intPin. However,
+    // if you do that it replaces the interrupt you've attached earlier and, even though
+    // you can reattach your interrupt afterwards there's always the chance that the
+    // interrupt goes off betweeen detachment and reattachment in which case we'll
+    // miss it
     if (inTheWorkingDay) {
         // If we're in the working day, sleep with the network connection up so
-        // that we can send reports.  Stay asleep unless sleepy-time has ended
-        while (sleepForSeconds > 0) {
-            System.sleep(intPin, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
-            sleepForSeconds = wakeupTime - Time.now();
-            if (sleepForSeconds > 0) {
-                // If we've got sleep time left, it must have been the
-                // interrupt that fired
-                // NOTE: I know this looks a bit pants but the sleep function
-                // replaces any interrupt attached to intPin so there's not
-                // much alternative
-                intFlag = true;
-                debugInd(DEBUG_IND_NULL);
-           }
-        }
-        // Reattach the interrupt to intPin, since the sleep() function
-        // above will have replaced it
-        attachInterrupt(intPin);
-    } else {
-        // Nice deep sleep otherwise, listening to a pin that
-        // is set as an output and to always be low so that we're not
-        // woken up by external influences and, just in case, we
-        // go back to sleep if sleepy-time has not yet ended.
-        while (sleepForSeconds > 0) {
-            System.sleep(D3, RISING, sleepForSeconds);
-            sleepForSeconds = wakeupTime - Time.now();
-        }
+        // that we can send reports.
+        System.sleep(D3, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
+   } else {
+        // Nice deep sleep otherwise.
+        System.sleep(D3, RISING, sleepForSeconds);
     }
+    totalSleepSeconds += Time.now() - downTime;
 
     // It is no longer our first time
     firstTime = false;
