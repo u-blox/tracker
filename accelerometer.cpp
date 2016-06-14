@@ -128,7 +128,7 @@ bool Accelerometer::begin(void)
                 }
 
                 data[0] = 0x24;  // Activity threshold
-                data[1] = 0x10;  // Low
+                data[1] = 0x0A;  // Low
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);

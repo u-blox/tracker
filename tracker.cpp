@@ -141,18 +141,18 @@
 #define MIN_TIME_UNIX_UTC 1451606400 // 1 Jan 2016 @ midnight
 
 // The start time of daily operation (in Unix, UTC).
-// Use http://www.unixtimestamp.com/ to work this out.
-#define START_TIME_UNIX_UTC 1465718400 // 12 June 2016 @ 08:00
+// Use http://www.onlineconversion.com/unix_time.htm to work this out.
+#define START_TIME_UNIX_UTC 1465880400 // 14 June 2016 @ 05:00
 
-// Start of day in seconds after midnight.
-#define START_OF_WORKING_DAY_SECONDS 28800 // 08:00
+// Start of day in seconds after midnight UTC.
+#define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00
 
-// Duration of a workingi day in seconds.
+// Duration of a working day in seconds.
 #define LENGTH_OF_WORKING_DAY_SECONDS 36000 // 10 hours, so day ends at 18:00
 
 // Define this have the system run irrespective of the overall start time
 // and working day start/stop times above.
-#define DISABLE_WAKEUP_TIMES
+//#define DISABLE_WAKEUP_TIMES
 
 // Define this to do GPS readings irrespective of the state of the
 // accelerometer
@@ -508,8 +508,8 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
 static void updateTotalGpsSeconds() {
     uint32_t x = Time.now() - gpsPowerOnTime;
     
-    // Ignore silly values which could result if
-    // the timebase underneath us is update between
+    // Ignore silly values which could occur if
+    // the timebase underneath us is updated between
     // gpsPowerOnTime and now
     if (x < 31536000) {
         totalGpsSeconds += x;
@@ -742,13 +742,14 @@ void loop() {
 #ifdef DISABLE_WAKEUP_TIMES
         if (true) {
 #else
-        if (Time.now() >= START_TIME_UNIX_UTC) {
+        if (Time.now() >= START_TIME_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
 #endif
             uint32_t secondsSinceMidnight = Time.hour() * 3600 + Time.minute() * 60 + Time.second();
 #ifdef DISABLE_WAKEUP_TIMES
             if (true) {
 #else
-            if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS) && (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS)) {
+            if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) &&
+                (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS)) {
 #endif
                 inTheWorkingDay = true;
 
@@ -774,10 +775,10 @@ void loop() {
                     
                     // Queue a GPS report, if required
                     if ((Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
-                        // If we've moved, take a new reading
-                        if (inMotion) {
+                        // If we've moved, or don't yet have a valid reading, take a new reading
+                        if (inMotion || (lastLatitude == TinyGPS::GPS_INVALID_F_ANGLE) || (lastLongitude == TinyGPS::GPS_INVALID_F_ANGLE)) {
                             numLoopsGpsRunning++;
-                            Serial.println ("*** Motion was detected, getting latest GPS reading.");
+                            Serial.println ("*** Motion was detected, or no valid reading, getting latest GPS reading.");
                             // Get the latest output from GPS
                             gpsUpdate(gpsOnTime, &lastLatitude, &lastLongitude);
                             // Reset the flag
@@ -861,11 +862,11 @@ void loop() {
                 }
             } else {
                 // We're awake outside the working day, calculate the new wake-up time
-                if (sleepForSeconds < START_OF_WORKING_DAY_SECONDS) {
-                    sleepForSeconds = Time.now() + START_OF_WORKING_DAY_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+                if (secondsSinceMidnight < START_OF_WORKING_DAY_SECONDS) {
+                    sleepForSeconds = START_OF_WORKING_DAY_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                 } else {
-                    // Must be after the end of the day, so wake-up next tomorrow morning
-                    sleepForSeconds = Time.now() + START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+                    // Must be after the end of the day, so wake up next tomorrow morning
+                    sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                 }
                 if (sleepForSeconds > 0) {
                     Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d seconds in order to wake up at %s.\n",
