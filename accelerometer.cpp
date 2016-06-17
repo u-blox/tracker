@@ -16,8 +16,8 @@ Accelerometer::EventsBitmap_t Accelerometer::handleInterrupt(void)
     // Read what happened
     Wire.beginTransmission(ACCELEROMETER_ADDRESS);
     Wire.write(0x30);
-    Wire.endTransmission(true);
-
+    Wire.endTransmission();
+    
     if (Wire.requestFrom(ACCELEROMETER_ADDRESS, (uint8_t) 1) == 1) {
         eventReg = Wire.read();
 
@@ -128,7 +128,7 @@ bool Accelerometer::begin(void)
                 }
 
                 data[0] = 0x24;  // Activity threshold
-                data[1] = 0x0A;  // Low
+                data[1] = 0x10;  // Low
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);

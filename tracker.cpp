@@ -124,6 +124,9 @@
 // The periodicity of telemetry reports.
 #define TELEMETRY_PERIOD_SECONDS 600
 
+// The periodicity of stats reports.
+#define STATS_PERIOD_SECONDS WAKEUP_PERIOD_SECONDS
+
 // The report period in seconds .
 #define REPORT_PERIOD_SECONDS 120
 
@@ -149,6 +152,9 @@
 
 // Duration of a working day in seconds.
 #define LENGTH_OF_WORKING_DAY_SECONDS 36000 // 10 hours, so day ends at 18:00
+
+// Enable stats reporting
+#define ENABLE_STATS_REPORTING
 
 // Define this have the system run irrespective of the overall start time
 // and working day start/stop times above.
@@ -179,6 +185,7 @@ typedef enum {
     RECORD_TYPE_NULL,
     RECORD_TYPE_TELEMETRY,
     RECORD_TYPE_GPS,
+    RECORD_TYPE_STATS,
     MAX_NUM_RECORD_TYPES
 } RecordType_t;
 
@@ -204,7 +211,7 @@ typedef enum {
 
 // Record type strings
 // NOTE: must match the RecordType enum above
-const char * recordTypeString[] = {"null", "telemetry", "gps"};
+const char * recordTypeString[] = {"null", "telemetry", "gps", "stats"};
 
 // The IMEI of the module
 char imei[IMEI_LENGTH] = "";
@@ -220,6 +227,9 @@ time_t lastPingSeconds = 0;
 
 // Time Of the last telemetry message
 time_t lastTelemetrySeconds = 0;
+
+// Time of the last stats report
+time_t lastStatsSeconds = 0;
 
 // Time Of the last report
 time_t lastReportSeconds = 0;
@@ -253,14 +263,14 @@ bool forceSend = false;
 // The time we went to sleep
 time_t sleepTime = 0;
 
-// Interrupt flag
-volatile bool intFlag = false;
-
 // Boolean to flag that we're moving
 bool inMotion = true;
 
 // Count the number of times around the loop, for info
 uint32_t numLoops = 0;
+
+// Count the number of loops on which motion was detected, for info
+uint32_t numLoopsMotionDetected = 0;
 
 // Count the number of loops for which a GPS fix was attempted, for info
 uint32_t numLoopsGpsRunning = 0;
@@ -284,9 +294,6 @@ TinyGPS gps;
 // Instantiate the accelerometer
 Accelerometer accelerometer = Accelerometer();
 
-// The pin that the accelerometer interrupt is attached to
-const int intPin = WKP;
-
 // Instantiate a fuel gauge
 FuelGauge fuel;
 
@@ -297,8 +304,6 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
  * FUNCTION PROTOTYPES
  ***************************************************************/
 
-static void intPinOccurred();
-static bool attachInterrupt(int pin);
 static void handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
 static int getImeiCallBack(int type, const char* pBuf, int len, char* imei);
@@ -312,34 +317,22 @@ static bool establishTime();
 static char * getRecord(RecordType_t type);
 static void queueTelemetryReport();
 static void queueGpsReport(float latitude, float longitude);
+static void queueStatsReport();
 
 /****************************************************************
  * STATIC FUNCTIONS
  ***************************************************************/
 
-// Deal with an interrupt from intPin
-static void intPinOccurred() {
-    // No bandwidth to do anything here, just flag it
-    intFlag = true;
-    debugInd(DEBUG_IND_TOGGLE);
-}
-
-// Attach the intPinOccurred() interrupt function to the given pin
-static bool attachInterrupt(int pin) {
-    bool success = false;
-    
-    if (attachInterrupt(pin, intPinOccurred, RISING)) {
-        success = true;
-        Serial.printf ("Interrupt attached to pin %d.\n", pin);
-    } else {
-        Serial.println ("WARNING: couldn't attach interrupt to pin.");
-    }
-    
-    return success;
-}
-
 // Handle the accelerometer interrupt, though do NOT call this from
 // an interrupt context as it does too much
+// NOTE: though we set-up interrupts and read the interrupt registers
+// on the ADXL345 chip, and the ADXL345 INT1 line is wired to the
+// WKP pin on the Electron board, we don't use the interrupt to wake
+// us up.  Instead we wake-up at a regular interval and then check
+// with this function whether the interrupt went off or not.  This
+// stops us waking up all the time and allows us to set a nice
+// low threshold for activity, so that we can be sure we wake-up, but
+// still send GPS readings at sensible intervals.
 static void handleInterrupt() {
     Accelerometer::EventsBitmap_t eventsBitmap;
     
@@ -418,18 +411,18 @@ static uint8_t incModRecords (uint8_t x) {
 // GPS was switched on
 static time_t gpsOn() {
     // If it's already on, total up the time
-    if (!digitalRead(D2)) {
+    if (digitalRead(D2)) {
         gpsPowerOnTime = Time.now();
     }
-    digitalWrite(D2, HIGH);
+    digitalWrite(D2, LOW);
     
     return Time.now();
 }
 
 // Switch GPS off
 static void gpsOff() {
-    if (digitalRead(D2)) {
-        digitalWrite(D2, LOW);
+    if (!digitalRead(D2)) {
+        digitalWrite(D2, HIGH);
         updateTotalGpsSeconds();
     }
 }
@@ -612,7 +605,6 @@ static void queueTelemetryReport() {
         Serial.println("WARNING: couldn't fit timestamp into report.");
     }
     
-    // Add the closing brace (and the terminator)
     Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
@@ -647,6 +639,73 @@ static void queueGpsReport(float latitude, float longitude) {
     Serial.printf ("%d byte(s) of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
+// Queue a stats report
+static void queueStatsReport() {
+    char *pRecord;
+    uint32_t contentsIndex = 0;
+    
+    Serial.println("Queuing a stats report.");
+    
+    uint32_t upTimeSeconds = millis() / 1000 + totalSleepSeconds;
+    if (upTimeSeconds == 0) {
+        upTimeSeconds = 1; // avoid div by 0
+    }
+
+    // Start a new record
+    pRecord = getRecord(RECORD_TYPE_STATS);
+
+    // Add the device ID
+    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, imei);  // -1 for terminator
+
+    // Add up-time
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d %d:%02d:%02d",
+                                   upTimeSeconds / 86400, (upTimeSeconds / 3600) % 24, (upTimeSeconds / 60) % 60,  upTimeSeconds % 60);  // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit up-time into report.");
+    }
+    
+    // Add %age power save time
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d%%", totalSleepSeconds * 100 / upTimeSeconds);  // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit percentage power saving time into report.");
+    }
+    
+    // Add %age GPS on time
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";~%d%%", totalGpsSeconds * 100 / upTimeSeconds);  // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit percentage GPS on time into report.");
+    }
+    
+    // Add loop counts
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";L%dM%dG%dF%d%%",
+                                   numLoops, numLoopsMotionDetected, numLoopsGpsRunning, (numLoopsGpsFix != 0) ? (numLoopsGpsFix * 100 / numLoopsGpsRunning) : 0); // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit loop counts into report.");
+    }
+    
+    // Add last accelerometer reading
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d-%d-%d",
+                                   accelerometerReading.x, accelerometerReading.y, accelerometerReading.z); // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit last accelerometer reading into report.");
+    }
+    
+    // Add Unix time
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) Time.now());  // -1 for terminator
+        Serial.printf("Time now is %s UTC.\n", Time.timeStr().c_str());
+    } else {
+        Serial.println("WARNING: couldn't fit timestamp into report.");
+    }
+    
+    Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+}
+
 /****************************************************************
  * GLOBAL FUNCTIONS
  ***************************************************************/
@@ -674,7 +733,7 @@ void setup() {
     // and set it to ON to allow GPS position to be established
     // while we do everything else
     pinMode(D2, OUTPUT);
-    digitalWrite (D2, LOW);
+    digitalWrite (D2, HIGH);
     gpsOn();
 
     // After a reset of the Electron board it takes a Windows PC several seconds
@@ -700,10 +759,6 @@ void setup() {
     Serial.println("Getting IMEI...");
     Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
     Serial.println("Started.");
-    
-    // Attach an interrupt to the wake-up pin so that to handle
-    // the accelerometer interrupt (while we're not sleeping)
-    attachInterrupt(intPin);
 }
 
 void loop() {
@@ -713,10 +768,8 @@ void loop() {
     // This only for info
     numLoops++;
     
-    // Deal with the interrupt here, nice and calm, out of interrupt context
-    // NOTE: always read it, irrespective of the flag, as if we happened
-    // to miss the interrupt for some reason we'd get stuck if we didn't
-    // handle it (which is also the thing that clears it)
+    // Check here if the interrupt occurred, nice and calm,
+    // outside interrupt context
     handleInterrupt();
 
     if (!firstTime) {
@@ -776,9 +829,15 @@ void loop() {
                     // Queue a GPS report, if required
                     if ((Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
                         // If we've moved, or don't yet have a valid reading, take a new reading
-                        if (inMotion || (lastLatitude == TinyGPS::GPS_INVALID_F_ANGLE) || (lastLongitude == TinyGPS::GPS_INVALID_F_ANGLE)) {
+                        bool getFix = inMotion || (lastLatitude == TinyGPS::GPS_INVALID_F_ANGLE) || (lastLongitude == TinyGPS::GPS_INVALID_F_ANGLE);
+                        if (getFix) {
+                            if (inMotion) {
+                                numLoopsMotionDetected++;
+                                Serial.println ("*** Motion was detected, getting latest GPS reading.");
+                            } else {
+                                Serial.println ("No fix yet, getting GPS reading.");
+                            }
                             numLoopsGpsRunning++;
-                            Serial.println ("*** Motion was detected, or no valid reading, getting latest GPS reading.");
                             // Get the latest output from GPS
                             gpsUpdate(gpsOnTime, &lastLatitude, &lastLongitude);
                             // Reset the flag
@@ -795,6 +854,14 @@ void loop() {
                             queueGpsReport(lastLatitude, lastLongitude);
                         }
                     }
+                    
+#ifdef ENABLE_STATS_REPORTING
+                    if (Time.now() - lastStatsSeconds >= STATS_PERIOD_SECONDS) {
+                        lastStatsSeconds = Time.now();
+                        queueStatsReport();
+                        Serial.println("Queuing a stats report.");
+                    }
+#endif
                     
                     // Check if it's time to publish
                     if (forceSend || ((Time.now() - lastReportSeconds >= REPORT_PERIOD_SECONDS) && (numRecordsQueued >= QUEUE_SEND_LEN))) {
@@ -903,8 +970,8 @@ void loop() {
     Serial.printf("Stats: up-time %d %d:%02d:%02d (since %s), of which %d%% was in power-save mode.\n",
                   x / 86400, (x / 3600) % 24, (x / 60) % 60,  x % 60, Time.timeStr(Time.now() - x).c_str(), totalSleepSeconds * 100 / x);
     Serial.printf("       GPS has been on for ~%d%% of the up-time.\n", totalGpsSeconds * 100 / x);
-    Serial.printf("       looped %d time(s), detected motion on %d loop(s) and obtained a GPS fix on %d (%d%%) of those loop(s).\n",
-                  numLoops, numLoopsGpsRunning, numLoopsGpsFix, (numLoopsGpsFix != 0) ? (numLoopsGpsRunning * 100 / numLoopsGpsFix) : 0);
+    Serial.printf("       looped %d time(s), motion on %d loop(s), GPS running on %d loops and fix obtained (%d%%) of the time(s).\n",
+                  numLoops, numLoopsMotionDetected, numLoopsGpsRunning, (numLoopsGpsFix != 0) ? (numLoopsGpsFix * 100 / numLoopsGpsRunning) : 0);
     Serial.printf("       last accelerometer reading: x = %d, y = %d, z = %d.\n", accelerometerReading.x, accelerometerReading.y, accelerometerReading.z);
     Serial.printf("Loop %d: now sleeping for %d second(s) (will awake at %s UTC).\n",
                   numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
@@ -924,9 +991,13 @@ void loop() {
     // listening to a pin that is an output and always low.
     // NOTE: I originally had the "inTheWorkingDay" code waking up on intPin. However,
     // if you do that it replaces the interrupt you've attached earlier and, even though
-    // you can reattach your interrupt afterwards there's always the chance that the
-    // interrupt goes off betweeen detachment and reattachment in which case we'll
-    // miss it
+    // you can reattach your interrupt afterwards, there's always the chance that the
+    // interrupt goes off betweeen detachment and reattachment, in which case we'll
+    // miss it.  Also, waking up all the time on intPin means you would have to tune the
+    // accelerometer to go off at a sensible yet not stupid level (otherwise it would
+    // waste power) and go back to sleep again if some back-off interval had not been
+    // met.  Too complicated, better to keep things simple; our GPS fix interval is 30
+    // seconds in any case.
     if (inTheWorkingDay) {
         // If we're in the working day, sleep with the network connection up so
         // that we can send reports.
