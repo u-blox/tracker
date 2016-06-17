@@ -130,8 +130,8 @@
 // The report period in seconds .
 #define REPORT_PERIOD_SECONDS 120
 
-// The size of a JSON record.
-#define LEN_RECORD 60
+// The size of a report record.
+#define LEN_RECORD 80
 
 // The queue length at which to try sending a record.
 #define QUEUE_SEND_LEN 4
@@ -272,11 +272,19 @@ uint32_t numLoops = 0;
 // Count the number of loops on which motion was detected, for info
 uint32_t numLoopsMotionDetected = 0;
 
+// Count the number of loops where position  was needed, for info
+uint32_t numLoopsLocationNeeded = 0;
+
 // Count the number of loops for which a GPS fix was attempted, for info
-uint32_t numLoopsGpsRunning = 0;
+uint32_t numLoopsGpsOn = 0;
 
 // Count the number of loops for which a GPS fix was achieved, for info
 uint32_t numLoopsGpsFix = 0;
+
+// Count the number of loops for which we reported a valid location
+// (which is different to numLoopsGpsFix as we may not need to get a fix
+// if we haven't moved)
+uint32_t numLoopsLocationValid = 0;
 
 // Count the number of seconds we've been asleep for
 uint32_t totalSleepSeconds = 0;
@@ -481,7 +489,7 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
         Serial.printf("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f.\n",
                       Time.now() - startTimeSeconds, latitude, longitude);
     } else {
-        Serial.printf("No fix yet.\n");
+        Serial.printf("No fix this time.\n");
     }
     
     // Update the stats
@@ -659,7 +667,7 @@ static void queueStatsReport() {
 
     // Add up-time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d %d:%02d:%02d",
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld %ld:%02ld:%02ld",
                                    upTimeSeconds / 86400, (upTimeSeconds / 3600) % 24, (upTimeSeconds / 60) % 60,  upTimeSeconds % 60);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit up-time into report.");
@@ -667,22 +675,22 @@ static void queueStatsReport() {
     
     // Add %age power save time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d%%", totalSleepSeconds * 100 / upTimeSeconds);  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld%%", totalSleepSeconds * 100 / upTimeSeconds);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit percentage power saving time into report.");
     }
     
     // Add %age GPS on time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";~%d%%", totalGpsSeconds * 100 / upTimeSeconds);  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";~%ld%%", totalGpsSeconds * 100 / upTimeSeconds);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit percentage GPS on time into report.");
     }
     
-    // Add loop counts
+    // Add loop counts and position percentage
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";L%dM%dG%dF%d%%",
-                                   numLoops, numLoopsMotionDetected, numLoopsGpsRunning, (numLoopsGpsFix != 0) ? (numLoopsGpsFix * 100 / numLoopsGpsRunning) : 0); // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";L%ldM%ldG%ldP%ld%%",
+                                   numLoops, numLoopsMotionDetected, numLoopsGpsOn, (numLoopsLocationNeeded != 0) ? (numLoopsLocationValid * 100 / numLoopsLocationNeeded) : 0); // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit loop counts into report.");
     }
@@ -828,6 +836,7 @@ void loop() {
                     
                     // Queue a GPS report, if required
                     if ((Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
+                        numLoopsLocationNeeded++;
                         // If we've moved, or don't yet have a valid reading, take a new reading
                         bool getFix = inMotion || (lastLatitude == TinyGPS::GPS_INVALID_F_ANGLE) || (lastLongitude == TinyGPS::GPS_INVALID_F_ANGLE);
                         if (getFix) {
@@ -837,9 +846,14 @@ void loop() {
                             } else {
                                 Serial.println ("No fix yet, getting GPS reading.");
                             }
-                            numLoopsGpsRunning++;
+                            numLoopsGpsOn++;
                             // Get the latest output from GPS
-                            gpsUpdate(gpsOnTime, &lastLatitude, &lastLongitude);
+                            if (gpsUpdate(gpsOnTime, &lastLatitude, &lastLongitude)) {
+                                numLoopsGpsFix++;
+                            } else {
+                                lastLatitude = TinyGPS::GPS_INVALID_F_ANGLE;
+                                lastLongitude = TinyGPS::GPS_INVALID_F_ANGLE;
+                            }
                             // Reset the flag
                             inMotion = false;
                         }
@@ -849,7 +863,7 @@ void loop() {
                         if (true) {
 #endif
                         if ((lastLatitude != TinyGPS::GPS_INVALID_F_ANGLE) && (lastLongitude != TinyGPS::GPS_INVALID_F_ANGLE)) {
-                            numLoopsGpsFix++;
+                            numLoopsLocationValid++;
                             lastGpsSeconds = Time.now();
                             queueGpsReport(lastLatitude, lastLongitude);
                         }
@@ -967,13 +981,13 @@ void loop() {
     if (x == 0) {
         x = 1; // avoid div by 0
     }
-    Serial.printf("Stats: up-time %d %d:%02d:%02d (since %s), of which %d%% was in power-save mode.\n",
+    Serial.printf("Stats: up-time %ld %ld:%02ld:%02ld (since %s), of which %ld%% was in power-save mode.\n",
                   x / 86400, (x / 3600) % 24, (x / 60) % 60,  x % 60, Time.timeStr(Time.now() - x).c_str(), totalSleepSeconds * 100 / x);
-    Serial.printf("       GPS has been on for ~%d%% of the up-time.\n", totalGpsSeconds * 100 / x);
-    Serial.printf("       looped %d time(s), motion on %d loop(s), GPS running on %d loops and fix obtained (%d%%) of the time(s).\n",
-                  numLoops, numLoopsMotionDetected, numLoopsGpsRunning, (numLoopsGpsFix != 0) ? (numLoopsGpsFix * 100 / numLoopsGpsRunning) : 0);
+    Serial.printf("       GPS has been on for ~%ld%% of the up-time.\n", totalGpsSeconds * 100 / x);
+    Serial.printf("       looped %ld time(s), motion on %ld loop(s), GPS running on %ld loops and position was valid (%ld%%) of the time(s).\n",
+                  numLoops, numLoopsMotionDetected, numLoopsGpsOn, (numLoopsLocationNeeded != 0) ? (numLoopsLocationValid * 100 / numLoopsLocationNeeded) : 0);
     Serial.printf("       last accelerometer reading: x = %d, y = %d, z = %d.\n", accelerometerReading.x, accelerometerReading.y, accelerometerReading.z);
-    Serial.printf("Loop %d: now sleeping for %d second(s) (will awake at %s UTC).\n",
+    Serial.printf("Loop %ld: now sleeping for %ld second(s) (will awake at %s UTC).\n",
                   numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
                   Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
 
