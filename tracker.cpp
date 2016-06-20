@@ -1,3 +1,5 @@
+#include "TinyGPS.h"
+#include "accelerometer.h"
 #include "accelerometer.h"
 #include "TinyGPS.h"
 
@@ -97,6 +99,9 @@
 
 // A magic string to indicate that retained RAM has been initialised
 #define RETAINED_INITIALISED "RetInit"
+
+// Guard string that we can use to check for memory overwrites
+#define GUARD_STRING "DEADAREA"
 
 // The length of the IMEI, used as the device ID.
 #define IMEI_LENGTH 15
@@ -240,6 +245,8 @@ typedef struct {
     // Something to use as a key so that we know whether 
     // retained memory has been initialised or not
     char key[sizeof(RETAINED_INITIALISED)];
+    // Opening guard to check that retained memory is good
+    char guard0[sizeof(GUARD_STRING)];
     // The time we went to sleep
     time_t sleepTime;
     // The time we actually went down to lost power state
@@ -278,13 +285,15 @@ typedef struct {
     // Storage for fatals
     uint32_t numFatals;
     FatalType_t fatalList[20];
+    // Closing guard to check that retained memory is good
+    char guard1[sizeof(GUARD_STRING)];
 } Retained_t;
 
 /****************************************************************
  * GLOBAL VARIABLES
  ***************************************************************/
 
-char guard0[] = {"DEADAREA"};
+char guard2[] = {GUARD_STRING};
 
 // Record type strings
 // NOTE: must match the RecordType enum above
@@ -360,7 +369,7 @@ SYSTEM_MODE(SEMI_AUTOMATIC);
 // Enable retained memory
 STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
 
-char guard1[] = {"DEADAREA"};
+char guard3[] = {GUARD_STRING};
 
 /****************************************************************
  * DEBUG
@@ -400,6 +409,8 @@ static void checkIntegrity();
 static void resetRetained() {
     memset (&r, 0, sizeof (r));
     strcpy (r.key, RETAINED_INITIALISED);
+    strcpy (r.guard0, GUARD_STRING);
+    strcpy (r.guard1, GUARD_STRING);
     debugInd(DEBUG_IND_RETAINED_RESET);
 }
 
@@ -849,8 +860,10 @@ static void queueStatsReport() {
 
 // Check that all is OK with static memory, as far as we can
 static void checkIntegrity() {
-    ASSERT(strcmp(guard0, "DEADAREA") == 0, FATAL_TYPE_STATIC_MEMORY_UNDERRUN);
-    ASSERT(strcmp(guard1, "DEADAREA") == 0, FATAL_TYPE_STATIC_MEMORY_OVERRUN);
+    ASSERT(strcmp(r.guard0, GUARD_STRING) == 0, FATAL_TYPE_STATIC_MEMORY_UNDERRUN);
+    ASSERT(strcmp(r.guard1, GUARD_STRING) == 0, FATAL_TYPE_STATIC_MEMORY_OVERRUN);
+    ASSERT(strcmp(guard2, GUARD_STRING) == 0, FATAL_TYPE_STATIC_MEMORY_UNDERRUN);
+    ASSERT(strcmp(guard3, GUARD_STRING) == 0, FATAL_TYPE_STATIC_MEMORY_OVERRUN);
 }
 
 /****************************************************************
@@ -858,18 +871,18 @@ static void checkIntegrity() {
  ***************************************************************/
 
 void setup() {
-    char guard[] = {"DEADAREA"};
+    char guard[] = {GUARD_STRING};
     
     gotToSetup = true;
     
-    // Check that memory is good
-    checkIntegrity();
-
     // Set up retained memory, if required
     if (strcmp (r.key, RETAINED_INITIALISED) != 0) {
         resetRetained();
     }
     
+    // Check that memory is good
+    checkIntegrity();
+
     // Starting again
     r.numStarts++;
     
