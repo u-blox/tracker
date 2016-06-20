@@ -34,7 +34,7 @@
  *
  * MESSAGES
  *
- * The chosen (JSON) message formats are hilghly compressed to
+ * The chosen message formats are hilghly compressed to
  * save data and are of the following form:
  *
  * gps: 353816058851462;51.283645;-0.776569;1465283731
@@ -51,6 +51,10 @@
  * the battery left as a percentage, the third the signal strength
  * in dBm and the last one the timestamp in Unix time (UTC). All
  * fields must be present.  This is sent periodically.
+ *
+ * NOTE: in addition to the above there is a "stats" message with
+ * a similar format. This is used to send statistics purely as far
+ * as the Particle web server to assist with debugging this code.
  *
  * NOTE: it you want to use a different message format, maybe
  * using a more standard (though less efficient) JSON approach,
@@ -90,6 +94,9 @@
 /****************************************************************
  * MACROS
  ***************************************************************/
+
+// A magic string to indicate that retained RAM has been initialised
+#define RETAINED_INITIALISED "RetInit"
 
 // The length of the IMEI, used as the device ID.
 #define IMEI_LENGTH 15
@@ -131,7 +138,7 @@
 #define REPORT_PERIOD_SECONDS 120
 
 // The size of a report record.
-#define LEN_RECORD 80
+#define LEN_RECORD 120
 
 // The queue length at which to try sending a record.
 #define QUEUE_SEND_LEN 4
@@ -145,13 +152,16 @@
 
 // The start time of daily operation (in Unix, UTC).
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
-#define START_TIME_UNIX_UTC 1465880400 // 14 June 2016 @ 05:00
+#define START_TIME_UNIX_UTC 1466319600 // 19 June 2016 @ 07:00 UTC
 
 // Start of day in seconds after midnight UTC.
-#define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00
+#define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00 UTC, so 08:00 BST
 
 // Duration of a working day in seconds.
-#define LENGTH_OF_WORKING_DAY_SECONDS 36000 // 10 hours, so day ends at 18:00
+#define LENGTH_OF_WORKING_DAY_SECONDS 36000 // 10 hours, so day ends at 17:00 UTC (18:00 BST)
+
+// The accelerometer interrupt threshold (in units of 62.5 mg)
+#define ACCELEROMETER_INTERRUPT_THRESHOLD 16
 
 // Enable stats reporting
 #define ENABLE_STATS_REPORTING
@@ -172,6 +182,20 @@
 /****************************************************************
  * TYPES
  ***************************************************************/
+
+// The types of fatal error that can occur
+typedef enum {
+    FATAL_TYPE_NULL,
+    FATAL_TYPE_STATIC_MEMORY_UNDERRUN,
+    FATAL_TYPE_STATIC_MEMORY_OVERRUN,
+    FATAL_TYPE_STACK_UNDERRUN,
+    FATAL_TYPE_STACK_UNDERRUN_SETUP,
+    FATAL_TYPE_STACK_UNDERRUN_LOOP,
+    FATAL_RECORDS_OVERRUN_1,
+    FATAL_RECORDS_OVERRUN_2,
+    FATAL_RECORDS_OVERRUN_3,
+    MAX_NUM_FATAL_TYPES
+} FatalType_t;
 
 // Struct to hold an accelerometer reading
 typedef struct {
@@ -202,12 +226,65 @@ typedef enum {
     DEBUG_IND_TOGGLE,
     DEBUG_IND_GPS_FIX,
     DEBUG_IND_ACTIVITY,
+    DEBUG_IND_RETAINED_RESET,
     MAX_NUM_DEBUG_INDS
 } DebugInd_t;
+
+// The stuff that is stored in retained RAM.
+// NOTE: the variables that follow are retained so that
+// we can go to deep sleep outside the working day and
+// still keep a record of what happened from initial
+// power-on.  They are kept in one structure so that
+// they can all be reset with a memset()
+typedef struct {
+    // Something to use as a key so that we know whether 
+    // retained memory has been initialised or not
+    char key[sizeof(RETAINED_INITIALISED)];
+    // The time we went to sleep
+    time_t sleepTime;
+    // The time we actually went down to lost power state
+    time_t powerSaveTime;
+    // Count the number of times around the loop, for info
+    uint32_t numLoops;
+    // Count the number of loops on which motion was detected, for info
+    uint32_t numLoopsMotionDetected;
+    // Count the number of loops where position  was needed, for info
+    uint32_t numLoopsLocationNeeded;
+    // Count the number of loops for which a GPS fix was attempted, for info
+    uint32_t numLoopsGpsOn;
+    // Count the number of loops for which a GPS fix was achieved, for info
+    uint32_t numLoopsGpsFix;
+    // Count the number of loops for which we reported a valid location
+    // (which is different to numLoopsGpsFix as we may not need to get a fix
+    // if we haven't moved)
+    uint32_t numLoopsLocationValid;
+    // Count the number of seconds we've been in power saving state for
+    uint32_t totalPowerSaveSeconds;
+    // Count the number of seconds GPS has been on for
+    time_t gpsPowerOnTime;
+    uint32_t totalGpsSeconds;
+    // Count the number of publish attempts
+    uint32_t numPublishAttempts;
+    // Count the number of publishes that failed
+    uint32_t numPublishFailed;
+    // Count the number of connect attempts
+    uint32_t numConnectAttempts;
+    // Count the number of connect failures
+    uint32_t numConnectFailed;
+    // Count the number of entries into Setup()
+    uint32_t numStarts;
+    // Hold the last accelerometer reading
+    AccelerometerReading_t accelerometerReading;
+    // Storage for fatals
+    uint32_t numFatals;
+    FatalType_t fatalList[20];
+} Retained_t;
 
 /****************************************************************
  * GLOBAL VARIABLES
  ***************************************************************/
+
+char guard0[] = {"DEADAREA"};
 
 // Record type strings
 // NOTE: must match the RecordType enum above
@@ -217,7 +294,7 @@ const char * recordTypeString[] = {"null", "telemetry", "gps", "stats"};
 char imei[IMEI_LENGTH] = "";
 
 // The amount of time to sleep for
-time_t sleepForSeconds;
+time_t sleepForSeconds = 0;
 
 // When we last tried to get a fix
 time_t lastGpsSeconds = 0;
@@ -234,67 +311,39 @@ time_t lastStatsSeconds = 0;
 // Time Of the last report
 time_t lastReportSeconds = 0;
 
-// The number of fixes after which to
-// publish what we've got
-uint32_t pubInterval = 4;
-
 // The last lat/long readings
 float lastLatitude = TinyGPS::GPS_INVALID_F_ANGLE;
 float lastLongitude = TinyGPS::GPS_INVALID_F_ANGLE;
 
 // The records accumulated
-Record_t records[50];
+Record_t records[100];
 
 // The current record
-uint8_t currentRecord = 0;
+uint32_t currentRecord = 0;
 
 // The next record to send
-uint8_t nextPubRecord = currentRecord;
+uint32_t nextPubRecord = currentRecord;
 
 // The number of records queued
-uint8_t numRecordsQueued = 0;
+uint32_t numRecordsQueued = 0;
 
-// Track if this is our first tine through
+// Track if this is our first time through
 bool firstTime = true;
 
 // Set this to force a send attempt
 bool forceSend = false;
 
-// The time we went to sleep
-time_t sleepTime = 0;
-
 // Boolean to flag that we're moving
 bool inMotion = true;
 
-// Count the number of times around the loop, for info
-uint32_t numLoops = 0;
+// Flag when we've got into the setup() code.
+// NOTE: this is used to allow us to detect that the
+// mode button has been pressed when the system is being
+// powered up.
+bool gotToSetup = false;
 
-// Count the number of loops on which motion was detected, for info
-uint32_t numLoopsMotionDetected = 0;
-
-// Count the number of loops where position  was needed, for info
-uint32_t numLoopsLocationNeeded = 0;
-
-// Count the number of loops for which a GPS fix was attempted, for info
-uint32_t numLoopsGpsOn = 0;
-
-// Count the number of loops for which a GPS fix was achieved, for info
-uint32_t numLoopsGpsFix = 0;
-
-// Count the number of loops for which we reported a valid location
-// (which is different to numLoopsGpsFix as we may not need to get a fix
-// if we haven't moved)
-uint32_t numLoopsLocationValid = 0;
-
-// Count the number of seconds we've been asleep for
-uint32_t totalSleepSeconds = 0;
-
-// Count the number of seconds GPS has been on for
-time_t gpsPowerOnTime = 0;
-uint32_t totalGpsSeconds = 0;
-
-// Hold the last accelerometer reading
-AccelerometerReading_t accelerometerReading;
+// All the retained variables
+retained Retained_t r;
 
 // Instantiate GPS
 TinyGPS gps;
@@ -308,28 +357,51 @@ FuelGauge fuel;
 // Only connect when it is required
 SYSTEM_MODE(SEMI_AUTOMATIC);
 
+// Enable retained memory
+STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
+
+char guard1[] = {"DEADAREA"};
+
+/****************************************************************
+ * DEBUG
+ ***************************************************************/
+
+// Macros to invoke fatals
+#define FATAL(fatalType) {if (r.numFatals < (sizeof (r.fatalList) / sizeof (r.fatalList[0]))) {r.fatalList[r.numFatals] = fatalType;} r.numFatals++; System.reset();}
+#define ASSERT(condition, fatalType) {if (!(condition)) {FATAL(fatalType)}}
+
 /****************************************************************
  * FUNCTION PROTOTYPES
  ***************************************************************/
 
+static void resetRetained();
 static void handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
 static int getImeiCallBack(int type, const char* pBuf, int len, char* imei);
-static uint8_t incModRecords (uint8_t x);
 static time_t gpsOn();
 static void gpsOff();
 static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude);
 static void updateTotalGpsSeconds();
-static void connect();
+static bool connect();
 static bool establishTime();
 static char * getRecord(RecordType_t type);
+static void freeRecord(Record_t *pRecord);
+static uint32_t incModRecords (uint32_t x);
 static void queueTelemetryReport();
 static void queueGpsReport(float latitude, float longitude);
 static void queueStatsReport();
+static void checkIntegrity();
 
 /****************************************************************
  * STATIC FUNCTIONS
  ***************************************************************/
+
+// Reset the retained variables
+static void resetRetained() {
+    memset (&r, 0, sizeof (r));
+    strcpy (r.key, RETAINED_INITIALISED);
+    debugInd(DEBUG_IND_RETAINED_RESET);
+}
 
 // Handle the accelerometer interrupt, though do NOT call this from
 // an interrupt context as it does too much
@@ -346,7 +418,7 @@ static void handleInterrupt() {
     
     // Disable interrupts
     noInterrupts();
-    accelerometer.read (&accelerometerReading.x, &accelerometerReading.y, &accelerometerReading.z);
+    accelerometer.read (&r.accelerometerReading.x, &r.accelerometerReading.y, &r.accelerometerReading.z);
     eventsBitmap = accelerometer.handleInterrupt();
     // Re-enable interrupts
     interrupts();
@@ -379,11 +451,25 @@ static void debugInd(DebugInd_t debugInd) {
         case DEBUG_IND_OFF:
             digitalWrite(D7, LOW);
         break;
+        case DEBUG_IND_RETAINED_RESET:
+            // One long flash
+            digitalWrite(D7, LOW);
+            delay (25);
+            digitalWrite(D7, HIGH);
+            delay (500);
+            digitalWrite(D7, LOW);
+            delay (25);
+        break;
         case DEBUG_IND_TOGGLE:
             // This one is the lowest-cost debug option
             digitalWrite(D7, !(digitalRead(D7)));
         break;
         case DEBUG_IND_GPS_FIX:
+            // Two flashes
+            digitalWrite(D7, LOW);
+            delay (25);
+            digitalWrite(D7, HIGH);
+            delay (25);
             digitalWrite(D7, LOW);
             delay (25);
             digitalWrite(D7, HIGH);
@@ -392,10 +478,11 @@ static void debugInd(DebugInd_t debugInd) {
             delay (25);
         break;
         case DEBUG_IND_ACTIVITY:
+            // One flash
             digitalWrite(D7, LOW);
             delay (25);
             digitalWrite(D7, HIGH);
-            delay (100);
+            delay (25);
             digitalWrite(D7, LOW);
             delay (25);
         break;
@@ -404,23 +491,12 @@ static void debugInd(DebugInd_t debugInd) {
     }
 }
 
-// Increment a number and return the incremented
-// number modulo the number of records available
-static uint8_t incModRecords (uint8_t x) {
-    x++;
-    if (x >= (sizeof (records) / sizeof (Record_t))) {
-        x = 0;
-    }
-    
-    return x;
-}
-
 // Switch GPS on, returning the time that
 // GPS was switched on
 static time_t gpsOn() {
     // If it's already on, total up the time
     if (digitalRead(D2)) {
-        gpsPowerOnTime = Time.now();
+        r.gpsPowerOnTime = Time.now();
     }
     digitalWrite(D2, LOW);
     
@@ -430,9 +506,9 @@ static time_t gpsOn() {
 // Switch GPS off
 static void gpsOff() {
     if (!digitalRead(D2)) {
-        digitalWrite(D2, HIGH);
         updateTotalGpsSeconds();
     }
+    digitalWrite(D2, HIGH);
 }
 
 // Update the GPS, making sure it's been on for
@@ -507,31 +583,38 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
 
 // Keep track of some stats for info
 static void updateTotalGpsSeconds() {
-    uint32_t x = Time.now() - gpsPowerOnTime;
+    uint32_t x = Time.now() - r.gpsPowerOnTime;
     
     // Ignore silly values which could occur if
     // the timebase underneath us is updated between
     // gpsPowerOnTime and now
     if (x < 31536000) {
-        totalGpsSeconds += x;
+        r.totalGpsSeconds += x;
     }
     
-    gpsPowerOnTime = Time.now();
+    r.gpsPowerOnTime = Time.now();
 }
 
-// Connect to the network
-static void connect() {
-    if (!Particle.connected()) {
+// Connect to the network, returning true if successful
+static bool connect() {
+    bool success = false;
+    
+    if (Particle.connected()) {
+        success = true;
+    } else {
+        r.numConnectAttempts++;
         Serial.printf("Connecting to network (waiting for up to %d seconds)... ", WAIT_FOR_CONNECTION_SECONDS);
         Particle.connect();
         if (waitFor(Particle.connected, WAIT_FOR_CONNECTION_SECONDS)) {
+            success = true;
             Serial.println("Connected.");
         } else {
+            r.numConnectFailed++;
             Serial.println("WARNING: connection failed.");
         }
-    } else {
-        Serial.println("Already connected to network.");
     }
+    
+    return success;
 }
 
 // Make sure we have time sync
@@ -558,11 +641,15 @@ static char * getRecord(RecordType_t type) {
 
     Serial.printf("Using record %d.\n", currentRecord);
     
+    ASSERT (currentRecord < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_1);
+    
     if (records[currentRecord].isUsed) {
         Serial.println("WARNING: records queue has wrapped, over-writing old data.");
     } else {
         numRecordsQueued++;
     }
+    
+    ASSERT (numRecordsQueued < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_2);
     
     records[currentRecord].isUsed = true;
     records[currentRecord].type = type;
@@ -573,6 +660,27 @@ static char * getRecord(RecordType_t type) {
     Serial.printf("Incremented currentRecord to %d.\n", currentRecord);
     
     return pContents;
+}
+
+// Free a record
+static void freeRecord(Record_t *pRecord) {
+    if (pRecord) {
+        pRecord->isUsed = false;
+        if (numRecordsQueued > 0) {
+            numRecordsQueued--;
+        }
+    }
+}
+
+// Increment a number and return the incremented
+// number modulo the number of records available
+static uint32_t incModRecords (uint32_t x) {
+    x++;
+    if (x >= (sizeof (records) / sizeof (records[0]))) {
+        x = 0;
+    }
+    
+    return x;
 }
 
 // Queue a telemetry report
@@ -651,23 +759,34 @@ static void queueGpsReport(float latitude, float longitude) {
 static void queueStatsReport() {
     char *pRecord;
     uint32_t contentsIndex = 0;
+    uint32_t upTimeSeconds = millis() / 1000 + r.totalPowerSaveSeconds;
     
-    Serial.println("Queuing a stats report.");
-    
-    uint32_t upTimeSeconds = millis() / 1000 + totalSleepSeconds;
     if (upTimeSeconds == 0) {
         upTimeSeconds = 1; // avoid div by 0
     }
 
+    Serial.println("Queuing a stats report.");
+    
     // Start a new record
     pRecord = getRecord(RECORD_TYPE_STATS);
 
     // Add the device ID
     contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, imei);  // -1 for terminator
 
+    // Add fatal count and types
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";F%ld", r.numFatals); // -1 for terminator
+        for (uint8_t x = 0; (x < r.numFatals) && (x < (sizeof (r.fatalList) / sizeof (r.fatalList[0]))); x++) {
+            contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ".%02d", r.fatalList[x]); // -1 for terminator
+        }
+    }
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        Serial.println("WARNING: couldn't fit fatal count and types into report.");
+    }
+    
     // Add up-time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld %ld:%02ld:%02ld",
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld.%ld:%02ld:%02ld",
                                    upTimeSeconds / 86400, (upTimeSeconds / 3600) % 24, (upTimeSeconds / 60) % 60,  upTimeSeconds % 60);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit up-time into report.");
@@ -675,14 +794,14 @@ static void queueStatsReport() {
     
     // Add %age power save time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld%%", totalSleepSeconds * 100 / upTimeSeconds);  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld%%", r.totalPowerSaveSeconds * 100 / upTimeSeconds);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit percentage power saving time into report.");
     }
     
     // Add %age GPS on time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";~%ld%%", totalGpsSeconds * 100 / upTimeSeconds);  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";~%ld%%", r.totalGpsSeconds * 100 / upTimeSeconds);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit percentage GPS on time into report.");
     }
@@ -690,15 +809,29 @@ static void queueStatsReport() {
     // Add loop counts and position percentage
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";L%ldM%ldG%ldP%ld%%",
-                                   numLoops, numLoopsMotionDetected, numLoopsGpsOn, (numLoopsLocationNeeded != 0) ? (numLoopsLocationValid * 100 / numLoopsLocationNeeded) : 0); // -1 for terminator
+                                   r.numLoops, r.numLoopsMotionDetected, r.numLoopsGpsOn, (r.numLoopsLocationNeeded != 0) ? (r.numLoopsLocationValid * 100 / r.numLoopsLocationNeeded) : 0); // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit loop counts into report.");
     }
     
+    // Add connect counts
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";C%ld-%ld", r.numConnectAttempts, r.numConnectFailed); // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit connect counts into report.");
+    }
+    
+    // Add publish (== send) counts
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";S%ld-%ld", r.numPublishAttempts, r.numPublishFailed); // -1 for terminator
+    } else {
+        Serial.println("WARNING: couldn't fit publish counts into report.");
+    }
+
     // Add last accelerometer reading
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d-%d-%d",
-                                   accelerometerReading.x, accelerometerReading.y, accelerometerReading.z); // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";X%dY%dZ%d",
+                                   r.accelerometerReading.x, r.accelerometerReading.y, r.accelerometerReading.z); // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit last accelerometer reading into report.");
     }
@@ -714,11 +847,31 @@ static void queueStatsReport() {
     Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
+// Check that all is OK with static memory, as far as we can
+static void checkIntegrity() {
+    ASSERT(strcmp(guard0, "DEADAREA") == 0, FATAL_TYPE_STATIC_MEMORY_UNDERRUN);
+    ASSERT(strcmp(guard1, "DEADAREA") == 0, FATAL_TYPE_STATIC_MEMORY_OVERRUN);
+}
+
 /****************************************************************
  * GLOBAL FUNCTIONS
  ***************************************************************/
 
 void setup() {
+    char guard[] = {"DEADAREA"};
+    
+    gotToSetup = true;
+    
+    // Check that memory is good
+    checkIntegrity();
+
+    // Set up retained memory, if required
+    if (strcmp (r.key, RETAINED_INITIALISED) != 0) {
+        resetRetained();
+    }
+    
+    // Starting again
+    r.numStarts++;
     
     // Set time to zero when we start so that we know if time
     // is synchronised or not later on
@@ -727,6 +880,9 @@ void setup() {
     // Opens up a Serial port so you can listen over USB
     Serial.begin(9600);
     
+    // Attach a handler to the mode button
+    //System.on(button_status, buttonHandler);
+
     // Set D3 to be an ouput and zero so that we can use it as a sort
     // of NULL pin paremeter to the sleep() function
     pinMode(D3, OUTPUT);
@@ -754,8 +910,9 @@ void setup() {
     establishTime();
 
     // Set up all the necessary accelerometer bits
-    memset (&accelerometerReading, 0, sizeof (accelerometerReading));
     accelerometer.begin();
+    accelerometer.setActivityThreshold(ACCELEROMETER_INTERRUPT_THRESHOLD);
+    accelerometer.enableInterrupts();
 
     // Start the serial port for the GPS module
     Serial1.begin(9600);
@@ -767,14 +924,22 @@ void setup() {
     Serial.println("Getting IMEI...");
     Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
     Serial.println("Started.");
+
+    // Check that stack and memory are good
+    checkIntegrity();
+    ASSERT(strcmp(guard, "DEADAREA") == 0, FATAL_TYPE_STACK_UNDERRUN_SETUP);
 }
 
 void loop() {
+    char guard[] = {"DEADAREA"};
     bool inTheWorkingDay = false;
     time_t gpsOnTime = 0;
 
-    // This only for info
-    numLoops++;
+    // Check that memory is good
+    checkIntegrity();
+
+   // This only for info
+    r.numLoops++;
     
     // Check here if the interrupt occurred, nice and calm,
     // outside interrupt context
@@ -800,6 +965,11 @@ void loop() {
     // has not been established (via a connection to the Particle server),
     // try to establish it again
     if (establishTime()) {
+        // Total up the time we were in power save mode for
+        if (r.powerSaveTime != 0) {
+            r.totalPowerSaveSeconds += Time.now() - r.powerSaveTime;
+            r.powerSaveTime = 0;
+        }
 #ifdef DISABLE_WAKEUP_TIMES
         if (true) {
 #else
@@ -814,9 +984,9 @@ void loop() {
 #endif
                 inTheWorkingDay = true;
 
-                if (firstTime || (Time.now() >= sleepTime + WAKEUP_PERIOD_SECONDS)) {
+                if (firstTime || (Time.now() >= r.sleepTime + WAKEUP_PERIOD_SECONDS)) {
                     Serial.printf("\nAwake: time now is %s UTC, slept since %s UTC (%d second(s) ago).\n",
-                                  Time.timeStr().c_str(), Time.timeStr(sleepTime).c_str(), Time.now() - sleepTime);
+                                  Time.timeStr().c_str(), Time.timeStr(r.sleepTime).c_str(), Time.now() - r.sleepTime);
                                   
                     sleepForSeconds = WAKEUP_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                     
@@ -836,20 +1006,20 @@ void loop() {
                     
                     // Queue a GPS report, if required
                     if ((Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
-                        numLoopsLocationNeeded++;
-                        // If we've moved, or don't yet have a valid reading, take a new reading
+                        r.numLoopsLocationNeeded++;
+                        // If we've moved, or don't have a valid reading, take a new reading
                         bool getFix = inMotion || (lastLatitude == TinyGPS::GPS_INVALID_F_ANGLE) || (lastLongitude == TinyGPS::GPS_INVALID_F_ANGLE);
                         if (getFix) {
                             if (inMotion) {
-                                numLoopsMotionDetected++;
+                                r.numLoopsMotionDetected++;
                                 Serial.println ("*** Motion was detected, getting latest GPS reading.");
                             } else {
                                 Serial.println ("No fix yet, getting GPS reading.");
                             }
-                            numLoopsGpsOn++;
+                            r.numLoopsGpsOn++;
                             // Get the latest output from GPS
                             if (gpsUpdate(gpsOnTime, &lastLatitude, &lastLongitude)) {
-                                numLoopsGpsFix++;
+                                r.numLoopsGpsFix++;
                             } else {
                                 lastLatitude = TinyGPS::GPS_INVALID_F_ANGLE;
                                 lastLongitude = TinyGPS::GPS_INVALID_F_ANGLE;
@@ -858,62 +1028,75 @@ void loop() {
                             inMotion = false;
                         }
                     
-                        // Only report if we have a fix
+                        // If we have a valid reading (either a new one if we're moving, or the
+                        // previous one if we haven't moved) then report it
 #ifdef IGNORE_INVALID_GPS
                         if (true) {
 #endif
                         if ((lastLatitude != TinyGPS::GPS_INVALID_F_ANGLE) && (lastLongitude != TinyGPS::GPS_INVALID_F_ANGLE)) {
-                            numLoopsLocationValid++;
+                            r.numLoopsLocationValid++;
                             lastGpsSeconds = Time.now();
                             queueGpsReport(lastLatitude, lastLongitude);
                         }
                     }
                     
-#ifdef ENABLE_STATS_REPORTING
                     if (Time.now() - lastStatsSeconds >= STATS_PERIOD_SECONDS) {
                         lastStatsSeconds = Time.now();
                         queueStatsReport();
-                        Serial.println("Queuing a stats report.");
                     }
-#endif
-                    
+
                     // Check if it's time to publish
                     if (forceSend || ((Time.now() - lastReportSeconds >= REPORT_PERIOD_SECONDS) && (numRecordsQueued >= QUEUE_SEND_LEN))) {
-                        uint8_t sentCount = 0;
-                        uint8_t failedCount = 0;
-                        uint8_t x;
+                        uint32_t sentCount = 0;
+                        uint32_t failedCount = 0;
+                        uint32_t x;
+                        bool sendStatsReport = false;
                 
                         if (forceSend) {
                             Serial.println ("Force Send was set.");
                         }
                         forceSend = false;
                         
+#ifdef ENABLE_STATS_REPORTING
+                        sendStatsReport = true;
+#endif
                         // Publish any records that are marked as used
                         x = nextPubRecord;
                         Serial.printf("Sending reports (numRecordsQueued %d, nextPubRecord %d, currentRecord %d).\n", numRecordsQueued, x, currentRecord);
-                        connect();
-                
+
                         do {
+                            ASSERT (x < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_3);
                             Serial.printf("Report %d: ", x);
                             if (records[x].isUsed) {
-                                if (Particle.connected() && Particle.publish(recordTypeString[records[x].type], records[x].contents, 60, PRIVATE)) {
-                                    Serial.printf("sent %s.\n", records[x].contents);
-                                    records[x].isUsed = false;
-                                    if (numRecordsQueued > 0) {
-                                        numRecordsQueued--;
-                                    }
-                                    sentCount++;
-                                    // Only four publish operations can be performed per second, so
-                                    // put in a 1 second delay every four
-                                    if (sentCount % 4 == 0) {
-                                        delay (1000);
-                                    }
+                                // If this is a stats record and we're not reporting stats over the air
+                                // then just print this record and then mark it as not used
+                                if ((records[x].type == RECORD_TYPE_STATS) && !sendStatsReport) {
+                                    Serial.printf("[Stats: %s]\n", records[x].contents);
+                                    freeRecord(&(records[x]));
                                 } else {
-                                    failedCount++;
-                                    Serial.println("WARNING: send failed.");
+                                    // This is something we want to publish, so first connect
+                                    if (connect()) {
+                                        r.numPublishAttempts++;
+                                        if (Particle.publish(recordTypeString[records[x].type], records[x].contents, 60, PRIVATE)) {
+                                            Serial.printf("sent %s.\n", records[x].contents);
+                                            freeRecord((&records[x]));
+                                            sentCount++;
+                                            // In the Particle code only four publish operations can be performed per second,
+                                            // so put in a 1 second delay every four
+                                            if (sentCount % 4 == 0) {
+                                                delay (1000);
+                                            }
+                                        } else {
+                                            r.numPublishFailed++;
+                                            failedCount++;
+                                            Serial.println("WARNING: send failed.");
+                                        }
+                                    } else {
+                                        failedCount++;
+                                        Serial.println("WARNING: send failed due to not being connected.");
+                                    }
                                 }
-                                
-                                // If there has been no publish failure, increment the place to start next time
+                                // If there has not yet been a publish failure, increment the place to start next time
                                 if (failedCount == 0) {
                                     nextPubRecord = incModRecords(nextPubRecord);
                                     Serial.printf("Incremented nextPubRecord to %d.\n", nextPubRecord);
@@ -925,9 +1108,9 @@ void loop() {
                             // Increment x
                             x = incModRecords(x);
                             
-                        } while (x != incModRecords(currentRecord));
+                        } while (x != incModRecords(currentRecord));  // Loop until we've gone beyond the current record
                         
-                        Serial.printf("%d report(s) sent, %d failed to send.\n", sentCount, failedCount);
+                        Serial.printf("%ld report(s) sent, %ld failed to send.\n", sentCount, failedCount);
                         // If there's been a publish failure and nextPubRecord is
                         // equal to currentRecord then we must have wrapped.  In this
                         // case, increment nextPubRecord to keep things in time order.
@@ -939,7 +1122,7 @@ void loop() {
                     }
                 
                     // Back to sleep now
-                    sleepTime = Time.now();
+                    r.sleepTime = Time.now();
                 }
             } else {
                 // We're awake outside the working day, calculate the new wake-up time
@@ -961,7 +1144,7 @@ void loop() {
                 }
             }
         } else {
-            // We're awake when we shouldn't have started operation yet, calculate new wake-up time
+            // We're awake when we shouldn't have started operation at all yet, calculate new wake-up time
             sleepForSeconds = START_TIME_UNIX_UTC - Time.now() - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
             if (sleepForSeconds > 0) {
                 Serial.printf("Awake too early (time now %s UTC, expected start time %s UTC), going back to sleep for %d second(s) in order to wake up at %s.\n",
@@ -970,25 +1153,21 @@ void loop() {
             } else {
                 sleepForSeconds = 0;
             }
+            
+            // Also, clear the retained variables as we'd like a fresh start when we awake
+            resetRetained();
         }
+        
+        // Record the time we went into power saving state (only if we have established time though)
+        r.powerSaveTime = Time.now();
+        
     } else {
         Serial.printf("WARNING: unable to establish time (time now is %d).\n", Time.now());
         sleepForSeconds = TIME_SYNC_RETRY_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
     }
 
-    // Print some stats
-    uint32_t x = millis() / 1000 + totalSleepSeconds;
-    if (x == 0) {
-        x = 1; // avoid div by 0
-    }
-    Serial.printf("Stats: up-time %ld %ld:%02ld:%02ld (since %s), of which %ld%% was in power-save mode.\n",
-                  x / 86400, (x / 3600) % 24, (x / 60) % 60,  x % 60, Time.timeStr(Time.now() - x).c_str(), totalSleepSeconds * 100 / x);
-    Serial.printf("       GPS has been on for ~%ld%% of the up-time.\n", totalGpsSeconds * 100 / x);
-    Serial.printf("       looped %ld time(s), motion on %ld loop(s), GPS running on %ld loops and position was valid (%ld%%) of the time(s).\n",
-                  numLoops, numLoopsMotionDetected, numLoopsGpsOn, (numLoopsLocationNeeded != 0) ? (numLoopsLocationValid * 100 / numLoopsLocationNeeded) : 0);
-    Serial.printf("       last accelerometer reading: x = %d, y = %d, z = %d.\n", accelerometerReading.x, accelerometerReading.y, accelerometerReading.z);
     Serial.printf("Loop %ld: now sleeping for %ld second(s) (will awake at %s UTC).\n",
-                  numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
+                  r.numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
                   Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
 
     // Make sure the debug LED is off to save power
@@ -999,29 +1178,36 @@ void loop() {
 #ifdef DISABLE_WAKEUP_TIMES
     inTheWorkingDay = true;
 #endif
-    time_t downTime = Time.now();
-    // Now go to sleep for the allotted time.  If the accelerometer interrupts goes
+    // Now go to sleep for the allotted time.  If the accelerometer interrupt goes
     // off it will be flagged and dealt with when we're good and ready, hence we sleep
     // listening to a pin that is an output and always low.
     // NOTE: I originally had the "inTheWorkingDay" code waking up on intPin. However,
-    // if you do that it replaces the interrupt you've attached earlier and, even though
-    // you can reattach your interrupt afterwards, there's always the chance that the
-    // interrupt goes off betweeen detachment and reattachment, in which case we'll
-    // miss it.  Also, waking up all the time on intPin means you would have to tune the
-    // accelerometer to go off at a sensible yet not stupid level (otherwise it would
-    // waste power) and go back to sleep again if some back-off interval had not been
-    // met.  Too complicated, better to keep things simple; our GPS fix interval is 30
-    // seconds in any case.
+    // the System.sleep() call it replaces the interrupt you've attached earlier with its
+    // own interrupt handler and, even though you can reattach your interrupt afterwards,
+    // there's always the chance that the interrupt goes off betweeen detachment and
+    // reattachment, in which case we'll miss it.  Also, waking up all the time on intPin
+    // means you would have to tune the accelerometer to go off at a sensible yet not
+    // stupid level (otherwise it would waste power) and go back to sleep again if
+    // some back-off interval had not been met.  Too complicated, better to keep things
+    // simple; our GPS fix interval is short enough at 30 seconds in any case.
     if (inTheWorkingDay) {
         // If we're in the working day, sleep with the network connection up so
         // that we can send reports.
         System.sleep(D3, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
    } else {
-        // Nice deep sleep otherwise.
-        System.sleep(D3, RISING, sleepForSeconds);
+        // Nice deep sleep otherwise, making sure that GPS is off so that we
+        // don't get interrupted
+        // NOTE: we will come back from reset after this, only the
+        // retained variables will be kept
+        gpsOff();
+        accelerometer.disableInterrupts();
+        System.sleep(SLEEP_MODE_DEEP, sleepForSeconds);
     }
-    totalSleepSeconds += Time.now() - downTime;
-
+ 
     // It is no longer our first time
     firstTime = false;
+
+    // Check that stack and memory are good
+    ASSERT(strcmp(guard, "DEADAREA") == 0, FATAL_TYPE_STACK_UNDERRUN_LOOP);
+    checkIntegrity();
 }

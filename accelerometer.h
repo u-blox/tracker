@@ -31,6 +31,16 @@ public:
     // \param pZ Z axis data.
     // \return true if the accelerometer was read successfully, otherwise false.
     bool read(int16_t *pX, int16_t *pY, int16_t *pZ);
+    /// Set the activity threshold that should trigger an interrupt.
+    // \param threshold  the threshold to set.  The units are 62.5 mg steps.
+    // \return true if the threshold was set successfully, otherwise false.
+    bool setActivityThreshold(uint8_t threshold);
+    /// Enable interrupts.
+    // \return true if interrupts were switched on successfully, otherwise false.
+    bool enableInterrupts(void);
+    /// Disable interrupts.
+    // \return true if interrupts were switched off successfully, otherwise false.
+    bool disableInterrupts(void);
     
 private:
     /// Debug

@@ -1,7 +1,6 @@
 #include "accelerometer.h"
 
 #define ACCELEROMETER_ADDRESS   ((uint8_t) 0x53)
-#define ACCELEROMETER_INT_ENABLE_REG_VALUE 0x70   // Enable the activity, single-tap and double-tap interrupts
 
 // ----------------------------------------------------------------
 // INTERRUPT HANDLER
@@ -89,7 +88,7 @@ void Accelerometer::readDeviceRegisters(uint8_t address, uint32_t reg, uint8_t n
 // PUBLIC FUNCTIONS
 // ----------------------------------------------------------------
 
-/// Power up the accelerometer.
+/// Set up the accelerometer.
 bool Accelerometer::begin(void)
 {
     uint8_t bytesWritten;
@@ -113,8 +112,7 @@ bool Accelerometer::begin(void)
                 
                 Serial.printf("Accelerometer is connected at I2C address 0x%02x.\n", ACCELEROMETER_ADDRESS);
                 
-                // Set up the interrupts: activity, single-tap and
-                // free-fall
+                // Set up the interrupts: activity only
                 data[0] = 0x2E;
                 data[1] = 0x00;  // Disable all interrupts for the moment
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
@@ -151,42 +149,6 @@ bool Accelerometer::begin(void)
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
 
-                data[0] = 0x1D;  // Single-tap threshold
-                data[1] = 0x4F;  // Middling
-                Wire.beginTransmission(ACCELEROMETER_ADDRESS);
-                bytesWritten = Wire.write(data, 2);
-                Wire.endTransmission(true);
-
-                if (bytesWritten != 2) {
-                    success = false;
-                    Serial.printf("Accelerometer: I2C address 0x%02x, unable to set single-tap threshold register (0x%02x) to value 0x%02x.\n",
-                                  ACCELEROMETER_ADDRESS, data[0], data[1]);
-                }
-
-                data[0] = 0x21;  // Longest duration of single tap in 625 us units
-                data[1] = 0xA0;  // 100 ms
-                Wire.beginTransmission(ACCELEROMETER_ADDRESS);
-                bytesWritten = Wire.write(data, 2);
-                Wire.endTransmission(true);
-
-                if (bytesWritten != 2) {
-                    success = false;
-                    Serial.printf("Accelerometer: I2C address 0x%02x, unable to set single tap duration register (0x%02x) to value 0x%02x.\n",
-                                  ACCELEROMETER_ADDRESS, data[0], data[1]);
-                }
-
-                data[0] = 0x2A;  // Tap involvement setting
-                data[1] = 0x07;  // All axes involved
-                Wire.beginTransmission(ACCELEROMETER_ADDRESS);
-                bytesWritten = Wire.write(data, 2);
-                Wire.endTransmission(true);
-            
-                if (bytesWritten != 2) {
-                    success = false;
-                    Serial.printf("Accelerometer: I2C address 0x%02x, unable to set tap axes involvement register (0x%02x) to value 0x%02x.\n",
-                                  ACCELEROMETER_ADDRESS, data[0], data[1]);
-                }
-
                 data[0] = 0x2C; // Measurement rate
                 data[1] = 0x07; // The lowest rate
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
@@ -200,7 +162,7 @@ bool Accelerometer::begin(void)
                 }
 
                 data[0] = 0x2E;
-                data[1] = ACCELEROMETER_INT_ENABLE_REG_VALUE;
+                data[1] = 0x10;   // Enable the activity interrupt
                 Wire.beginTransmission(ACCELEROMETER_ADDRESS);
                 bytesWritten = Wire.write(data, 2);
                 Wire.endTransmission(true);
@@ -223,11 +185,6 @@ bool Accelerometer::begin(void)
                                   ACCELEROMETER_ADDRESS, data[0], data[1]);
                 }
 
-                // Call this just to clear any interrupts
-                handleInterrupt();
-                
-                success = true;
-            
             } else {
                 Serial.printf("Accelerometer: I2C address 0x%02x, reading value of register 0x00 got 0x%02x but expected 0xE5.\n",
                               ACCELEROMETER_ADDRESS, data[0]);
@@ -307,6 +264,136 @@ bool Accelerometer::read(int16_t *pX, int16_t *pY, int16_t *pZ)
     }
 
     Serial.printf("Accelerometer: x %d, y %d, z %d.\n", x, y, z);
+
+    return success;
+}
+
+/// Set the activity threshold for an interrupt to be triggered
+bool Accelerometer::setActivityThreshold(uint8_t threshold)
+{
+    uint8_t bytesWritten;
+    bool success = true;
+    uint8_t data[2];
+
+    data[0] = 0x24;  // Activity threshold
+    data[1] = threshold;
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set activity threshold register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    return success;
+}
+
+/// Enable interrupts from the accelerometer
+bool Accelerometer::enableInterrupts(void)
+{
+    uint8_t bytesWritten;
+    bool success = true;
+    uint8_t data[2];
+
+    // Set up the interrupts: activity only
+    data[0] = 0x2E;
+    data[1] = 0x00;  // Disable all interrupts for the moment
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set interrupt register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    data[0] = 0x24;  // Activity threshold
+    data[1] = 0x10;  // Low
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set activity threshold register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    data[0] = 0x27;  // Activity/inactivity control
+    data[1] = 0xF0;  // Compare changes, all axes participating
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set activity/inactivity register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    data[0] = 0x2C; // Measurement rate
+    data[1] = 0x07; // The lowest rate
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set measurement rate register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    // Call this just to clear any interrupts
+    handleInterrupt();
+
+    data[0] = 0x2E;
+    data[1] = 0x10;   // Enable the activity interrupt
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set interrupt enable register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    data[0] = 0x2D; // The power control register
+    data[1] = 0x08; // Measurement mode
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set power control register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
+
+    return success;
+}
+
+/// Disable interrupts from the accelerometer
+bool Accelerometer::disableInterrupts(void)
+{
+    uint8_t bytesWritten;
+    bool success = true;
+    uint8_t data[2];
+
+    data[0] = 0x2E;
+    data[1] = 0x00;  // Disable all interrupts
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(data, 2);
+    Wire.endTransmission(true);
+
+    if (bytesWritten != 2) {
+        success = false;
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to set interrupt register (0x%02x) to value 0x%02x.\n",
+                      ACCELEROMETER_ADDRESS, data[0], data[1]);
+    }
 
     return success;
 }
