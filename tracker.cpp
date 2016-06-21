@@ -30,7 +30,7 @@
  * - If, after establishing network time, the time is found to be
  *   less than START_TIME_UNIX_UTC then, the device returns to
  *   deep sleep (modem off, processor clocks and RAM off,
- *   ~0.1 mA consumed,) until START_TIME_UNIX_UTC is reached.
+ *   ~0.1 mA consumed) until START_TIME_UNIX_UTC is reached.
  * - If the time is greater than or equal to START_TIME_UNIX_UTC then
  *   the device checks if the working day has begun, i.e. is the time
  *   greater than START_OF_WORKING_DAY_SECONDS and less than
@@ -39,9 +39,9 @@
  *   - If the time is less than START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC
  *     then the device wakes up only for long enough to get a GPS reading, 
  *     "slow operation" (timing out at SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)
- *     and repeats this SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY, evenly spread
- *     throughout the working day.  Between wake-ups he device returns
- *     to deep sleep with the modem off.
+ *     and repeats this SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY times,
+ *     evenly spread throughout the working day.  Between wake-ups the
+ *     device returns to deep sleep with the modem off.
  *   - If the time is greater than or equal to
  *     START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC then the device remains
  *     awake for all of the working day, putting the processor to sleep but keeping
@@ -50,11 +50,11 @@
  * - If the time is not within the working day then the device returns to
  *   deep sleep, with modem off, until the start of the next working day.
  *
- * The default timings are set so that the device wakes-up for a few days
- * in slow operation and then goes into full working day operation later.
- * This was for a show where the trackers were installed a few days before the
- * start of the show and we wanted to monitor that they were OK but not consume a
- * lot of battery power.  By judicious choice of:
+ * The default timings are set so that the device wakes-up in slow operation and
+ * then goes into full working day operation a few days later. This was for a show
+ * where the trackers were installed a few days before the start of the show and
+ * we wanted to monitor that they were OK but not consume a lot of battery power.
+ * By judicious choice of:
  *
  *  - START_TIME_UNIX_UTC
  *  - START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC
@@ -62,9 +62,9 @@
  *  - LENGTH_OF_WORKING_DAY_SECONDS
  *  - SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY
  *
- * ... you should be able to achieve the tracker behaviour you want.  To
- * always get slow operation, set START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC to
- * a time far in the future.  To always get full monitoring throughout the working
+ * ... you should be able to achieve the tracker behaviour you want.  To always
+ * get slow operation, set START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC to a
+ * time far in the future.  To always get full monitoring throughout the working
  * day, set START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC to START_TIME_UNIX_UTC.
  * To set the working day to be 24 hours, set START_OF_WORKING_DAY_SECONDS to 0 and
  * LENGTH_OF_WORKING_DAY_SECONDS to 3600.
@@ -95,11 +95,12 @@
  * NOTE: in addition to the above there is a "stats" message with
  * a similar format. This is used to send statistics purely as far
  * as the Particle web server to assist with debugging this code.
+ * See queueStatsReport() for more details.
  *
  * NOTE: it you want to use a different message format, maybe
  * using a more standard (though less efficient) JSON approach,
- * simply modify queueTelemeteryReport() and queueGpsReport()
- * to match.
+ * simply modify queueTelemeteryReport(), queueGpsReport()
+ * (and, if required, queueStatsReport()) to match.
  *
  * NOTE on webhooks: Particle webhooks are really neat but they
  * can be a bit confusing to code.  First of all, when you
@@ -135,99 +136,99 @@
  * CONFIGURATION MACROS
  ***************************************************************/
 
-// The maximum amount of time to hang around waiting for a
+/// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
 #define WAIT_FOR_CONNECTION_SECONDS 60
 
-// How long to wait for things to sort themselves out (e.g. the
+/// How long to wait for things to sort themselves out (e.g. the
 // USB port) after waking up from sleep.
 #define WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS 5
 
-// How long to wait for the Particle server to respond to
+/// How long to wait for the Particle server to respond to
 // a time sync request
 #define TIME_SYNC_WAIT_SECONDS 10
 
-// If the system cannot establish time by talking to the 
+/// If the system cannot establish time by talking to the 
 // Particle server, wait this long and try again.
 // NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS.
 #define TIME_SYNC_RETRY_PERIOD_SECONDS 30
 
-// The time between GPS records  when moving.  This must always
+/// The time between GPS records  when moving.  This must always
 // be the minimum period because it is also used as the sleep
 // period.
 // NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS.
 #define GPS_PERIOD_SECONDS 30
 
-// The wake-up period in seconds.  This should be equal to the
+/// The wake-up period in seconds.  This should be equal to the
 // shortest wake-up period, which is usually the GPS one.
 #define WAKEUP_PERIOD_SECONDS GPS_PERIOD_SECONDS
 
-// The periodicity of telemetry reports.
+/// The periodicity of telemetry reports.
 #define TELEMETRY_PERIOD_SECONDS 600
 
-// The periodicity of stats reports.
+/// The periodicity of stats reports.
 #define STATS_PERIOD_SECONDS WAKEUP_PERIOD_SECONDS
 
-// The report period in seconds.  At this interval the
+/// The report period in seconds.  At this interval the
 // queued-up records are sent.
 #define REPORT_PERIOD_SECONDS 120
 
-// The size of a record.
+/// The size of a record.
 #define LEN_RECORD 120
 
-// The queue length at which to try sending a record.
+/// The queue length at which to try sending a record.
 #define QUEUE_SEND_LEN 4
 
-// The time allowed for GPS to sync each time, once
+/// The time allowed for GPS to sync each time, once
 // it has initially synchronised.
 #define GPS_FIX_TIME_SECONDS 10
 
-// The minimum possible value of Time (in Unix, UTC), used
+/// The minimum possible value of Time (in Unix, UTC), used
 // to check the sanity of our RTC time.
 #define MIN_TIME_UNIX_UTC 1451606400 // 1 Jan 2016 @ midnight
 
-// The start time for the device (in Unix, UTC).
+/// The start time for the device (in Unix, UTC).
 // If the device wakes up before this time it will return
 // to deep sleep.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
 #define START_TIME_UNIX_UTC 1466492400 // 21 June 2016 @ 07:00 UTC
 
-// The number of times to wake-up during the working day when in slow operation.
+/// The number of times to wake-up during the working day when in slow operation.
 #define SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY 2
 
-// The maximum amount of time to wait for a GPS fix to be established while we are in
+/// The maximum amount of time to wait for a GPS fix to be established while we are in
 // slow operation.  After this time, or as soon as a GPS fix has been established
 // and transmitted, we can go to deep sleep.
 #define SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS (60 * 10)
 
-// The start time for full working day operation (in Unix, UTC).
+/// The start time for full working day operation (in Unix, UTC).
 // After this time the device will be awake for the whole working day and send reports
 // as necessary.
 // This time must be later than or equal to START_TIME_UNIX_UTC.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
 #define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1468134000 // 10 July 2016 @ 07:00 UTC
 
-// Start of day in seconds after midnight UTC.
+/// Start of day in seconds after midnight UTC.
 #define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00 UTC, so 08:00 BST
 
-// Duration of a working day in seconds.
+/// Duration of a working day in seconds.
 #define LENGTH_OF_WORKING_DAY_SECONDS 36000 // 10 hours, so day ends at 17:00 UTC (18:00 BST)
 
-// The accelerometer interrupt threshold (in units of 62.5 mg).
+/// The accelerometer interrupt threshold (in units of 62.5 mg).
 #define ACCELEROMETER_INTERRUPT_THRESHOLD 16
 
 /****************************************************************
  * CONDITIONAL COMPILATION OPTIONS
  ***************************************************************/
 
-// Enable stats reporting
+/// Enable stats reporting.
 #define ENABLE_STATS_REPORTING
 
-// Define this to do GPS readings irrespective of the state of the
-// accelerometer
+/// Define this to do GPS readings irrespective of the state of the
+// accelerometer.
 //#define DISABLE_ACCELEROMETER
 
-// Define this to record GPS values even if the values are not valid.
+/// Define this to record GPS values even if the values are not valid.
 // The invalid value is TinyGPS::GPS_INVALID_F_ANGLE, which comes
 // out as 1000 degrees.
 //#define IGNORE_INVALID_GPS
@@ -237,23 +238,23 @@
  * OTHER MACROS
  ***************************************************************/
 
-// A magic string to indicate that retained RAM has been initialised
+/// A magic string to indicate that retained RAM has been initialised.
 #define RETAINED_INITIALISED "RetInit"
 
-// Guard string that we can use to check for memory overwrites
+/// Guard string that we can use to check for memory overwrites.
 #define GUARD_STRING "DEADAREA"
 
-// The length of the IMEI, used as the device ID.
+/// The length of the IMEI, used as the device ID.
 #define IMEI_LENGTH 15
 
-// Work out the number of seconds between each wake-up in slow mode
+/// Work out the number of seconds between each wake-up in slow mode.
 #define SLOW_MODE_INTERVAL_SECONDS (LENGTH_OF_WORKING_DAY_SECONDS / (SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY + 1))
 
 /****************************************************************
  * TYPES
  ***************************************************************/
 
-// The types of fatal error that can occur
+/// The types of fatal error that can occur.
 typedef enum {
     FATAL_TYPE_NULL,
     FATAL_TYPE_STATIC_MEMORY_UNDERRUN,
@@ -267,14 +268,14 @@ typedef enum {
     MAX_NUM_FATAL_TYPES
 } FatalType_t;
 
-// Struct to hold an accelerometer reading
+/// Struct to hold an accelerometer reading.
 typedef struct {
     int16_t x;
     int16_t y;
     int16_t z;
 } AccelerometerReading_t;
 
-// The possible record types
+/// The possible record types.
 typedef enum {
     RECORD_TYPE_NULL,
     RECORD_TYPE_TELEMETRY,
@@ -283,14 +284,14 @@ typedef enum {
     MAX_NUM_RECORD_TYPES
 } RecordType_t;
 
-// A single record
+/// A single record.
 typedef struct {
     bool isUsed;
     RecordType_t type;
     char contents[LEN_RECORD];
 } Record_t;
 
-// For debugging: LED flash types
+/// For debugging: LED flash types.
 typedef enum {
     DEBUG_IND_OFF,
     DEBUG_IND_TOGGLE,
@@ -300,12 +301,12 @@ typedef enum {
     MAX_NUM_DEBUG_INDS
 } DebugInd_t;
 
-// The stuff that is stored in retained RAM.
+/// The stuff that is stored in retained RAM.
 // NOTE: the variables that follow are retained so that
 // we can go to deep sleep and still keep a record of
 // what happened from initial power-on.  They are kept
 // in one structure so that they can all be reset with
-// a memset()
+// a memset().
 typedef struct {
     // Something to use as a key so that we know whether 
     // retained memory has been initialised or not
@@ -360,92 +361,79 @@ typedef struct {
  * GLOBAL VARIABLES
  ***************************************************************/
 
+/// Closing memory guard.
 char guard2[] = {GUARD_STRING};
 
-// Record type strings
-// NOTE: must match the RecordType_t enum above
+/// Record type strings.
+// NOTE: must match the RecordType_t enum above.
 const char * recordTypeString[] = {"null", "telemetry", "gps", "stats"};
 
-// The IMEI of the module
+/// The IMEI of the module.
 char imei[IMEI_LENGTH] = "";
 
-// The amount of time to sleep for
-time_t sleepForSeconds = 0;
-
-// When we last tried to get a fix
+/// When we last tried to get a fix.
 time_t lastGpsSeconds = 0;
 
-// Time Of the last ping message
+/// Time Of the last ping message.
 time_t lastPingSeconds = 0;
 
-// Time Of the last telemetry message
+/// Time Of the last telemetry message.
 time_t lastTelemetrySeconds = 0;
 
-// Time of the last stats report
+/// Time of the last stats report.
 time_t lastStatsSeconds = 0;
 
-// Time Of the last report
+/// Time Of the last report.
 time_t lastReportSeconds = 0;
 
-// The time at which setup was finished
+/// The time at which setup was finished.
 time_t setupCompleteSeconds = 0;
 
-// The last lat/long readings
+/// The last lat/long reading.
 float lastLatitude = TinyGPS::GPS_INVALID_F_ANGLE;
 float lastLongitude = TinyGPS::GPS_INVALID_F_ANGLE;
 
-// The records accumulated
+/// The records accumulated.
 Record_t records[100];
 
-// The current record
+/// The current record.
 uint32_t currentRecord = 0;
 
-// The next record to send
+/// The next record to send.
 uint32_t nextPubRecord = currentRecord;
 
-// The number of records queued
+/// The number of records queued.
 uint32_t numRecordsQueued = 0;
 
-// Track if this is our first time through
+/// Track if this is our first time through.
 bool firstTime = true;
 
-// Set this to force a send attempt
-bool forceSend = false;
-
-// Boolean to flag that we're moving
-bool inMotion = true;
-
-// Flag when we've got into the setup() code.
-// NOTE: this is used to allow us to detect that the
-// mode button has been pressed when the system is being
-// powered up.
-bool gotToSetup = false;
-
-// All the retained variables
+/// All the retained variables.
 retained Retained_t r;
 
-// Instantiate GPS
+/// Instantiate GPS.
 TinyGPS gps;
 
-// Instantiate the accelerometer
+/// Instantiate the accelerometer.
 Accelerometer accelerometer = Accelerometer();
 
-// Instantiate a fuel gauge
+/// Instantiate a fuel gauge.
 FuelGauge fuel;
 
-// Only connect when it is required
+/// Only connect when it is required.
 SYSTEM_MODE(SEMI_AUTOMATIC);
 
-// Enable retained memory
+/// Enable retained memory.
 STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
 
+/// Opening memory guard.
 char guard3[] = {GUARD_STRING};
 
 /****************************************************************
  * DEBUG
  ***************************************************************/
 
-// Macros to invoke asserts/fatals
+/// Macros to invoke asserts/fatals.
 #define FATAL(fatalType) {if (r.numFatals < (sizeof (r.fatalList) / sizeof (r.fatalList[0]))) {r.fatalList[r.numFatals] = fatalType;} r.numFatals++; System.reset();}
 #define ASSERT(condition, fatalType) {if (!(condition)) {FATAL(fatalType)}}
 
@@ -454,7 +442,7 @@ char guard3[] = {GUARD_STRING};
  ***************************************************************/
 
 static void resetRetained();
-static void handleInterrupt();
+static bool handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
 static int getImeiCallBack(int type, const char* pBuf, int len, char* imei);
 static time_t gpsOn();
@@ -469,13 +457,14 @@ static uint32_t incModRecords (uint32_t x);
 static void queueTelemetryReport();
 static void queueGpsReport(float latitude, float longitude);
 static void queueStatsReport();
+static uint32_t secondsToWorkingDayStart(uint32_t secondsToday);
 static void checkIntegrity();
 
 /****************************************************************
  * STATIC FUNCTIONS
  ***************************************************************/
 
-// Reset the retained variables
+/// Reset the retained variables.
 static void resetRetained() {
     memset (&r, 0, sizeof (r));
     strcpy (r.key, RETAINED_INITIALISED);
@@ -484,8 +473,8 @@ static void resetRetained() {
     debugInd(DEBUG_IND_RETAINED_RESET);
 }
 
-// Handle the accelerometer interrupt, though do NOT call this from
-// an interrupt context as it does too much
+/// Handle the accelerometer interrupt, returning true if activity
+// was detected, otherwise false.
 // NOTE: though we set-up interrupts and read the interrupt registers
 // on the ADXL345 chip, and the ADXL345 INT1 line is wired to the
 // WKP pin on the Electron board, we don't use the interrupt to wake
@@ -494,7 +483,8 @@ static void resetRetained() {
 // stops us waking up all the time and allows us to set a nice
 // low threshold for activity, so that we can be sure we wake-up, but
 // still send GPS readings at sensible intervals.
-static void handleInterrupt() {
+static bool handleInterrupt() {
+    bool activityDetected = false;
     Accelerometer::EventsBitmap_t eventsBitmap;
     
     // Disable interrupts
@@ -506,12 +496,14 @@ static void handleInterrupt() {
     
     // Flag if we're in motion
     if (eventsBitmap & Accelerometer::EVENT_ACTIVITY) {
-        inMotion = true;
+        activityDetected = true;
         debugInd(DEBUG_IND_ACTIVITY);
     }
+    
+    return activityDetected;
 }
 
-// Parse the IMEI from the module
+/// Parse the IMEI from the module.
 static int getImeiCallBack(int type, const char* pBuf, int len, char* imei) {
     
     if ((type == TYPE_UNKNOWN) && imei) {
@@ -523,7 +515,7 @@ static int getImeiCallBack(int type, const char* pBuf, int len, char* imei) {
     return WAIT;
 }
 
-// Use the LED on the board (on D7) for debug indications.
+/// Use the LED on the board (on D7) for debug indications.
 static void debugInd(DebugInd_t debugInd) {
     
     switch (debugInd) {
@@ -570,19 +562,19 @@ static void debugInd(DebugInd_t debugInd) {
     }
 }
 
-// Switch GPS on, returning the time that
-// GPS was switched on
+/// Switch GPS on, returning the time that
+// GPS was switched on.
 static time_t gpsOn() {
     if (digitalRead(D2)) {
         // Log the time that GPS was swithed on
         r.gpsPowerOnTime = Time.now();
     }
     digitalWrite(D2, LOW);
-    
+
     return Time.now();
 }
 
-// Switch GPS off
+/// Switch GPS off.
 static void gpsOff() {
     if (!digitalRead(D2)) {
         // Record the duration that GPS was on for
@@ -591,7 +583,7 @@ static void gpsOff() {
     digitalWrite(D2, HIGH);
 }
 
-// Update the GPS, making sure it's been on for
+/// Update the GPS, making sure it's been on for
 // enough time to give us a fix. If onTimeSeconds
 // is non-zero then it represents the time at which GPS
 // was already switched on.  pLatitude and pLongitude are
@@ -661,7 +653,7 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude)
     return fixAchieved;
 }
 
-// Keep track of some stats for info
+/// Keep track of GPS up-time for info.
 static void updateTotalGpsSeconds() {
     uint32_t x = Time.now() - r.gpsPowerOnTime;
     
@@ -671,11 +663,11 @@ static void updateTotalGpsSeconds() {
     if (x < 31536000) { // 1 year
         r.totalGpsSeconds += x;
     }
-    
+
     r.gpsPowerOnTime = Time.now();
 }
 
-// Connect to the network, returning true if successful
+/// Connect to the network, returning true if successful.
 static bool connect() {
     bool success = false;
     
@@ -697,7 +689,7 @@ static bool connect() {
     return success;
 }
 
-// Make sure we have time sync
+/// Make sure we have time sync.
 static bool establishTime() {
     bool success = false;
 
@@ -708,12 +700,11 @@ static bool establishTime() {
         delay(TIME_SYNC_WAIT_SECONDS * 1000);
     }
     
-    
     if (Time.now() >= MIN_TIME_UNIX_UTC) {
         success = true;
         if (setupCompleteSeconds < MIN_TIME_UNIX_UTC) {
             // If we didn't already have time established when we left setup(),
-            // reset it to a more correct right time here.
+            // reset it to a more correct time here.
             setupCompleteSeconds = Time.now();
         }
     }
@@ -721,7 +712,7 @@ static bool establishTime() {
     return success;
 }
 
-// Get a new record from the list
+/// Get a new record from the list.
 static char * getRecord(RecordType_t type) {
     char * pContents;
 
@@ -748,7 +739,7 @@ static char * getRecord(RecordType_t type) {
     return pContents;
 }
 
-// Free a record
+/// Free a record.
 static void freeRecord(Record_t *pRecord) {
     if (pRecord) {
         pRecord->isUsed = false;
@@ -758,8 +749,8 @@ static void freeRecord(Record_t *pRecord) {
     }
 }
 
-// Increment a number and return the incremented
-// number modulo the number of records available
+/// Increment a number and return the incremented
+// number modulo the number of records available.
 static uint32_t incModRecords (uint32_t x) {
     x++;
     if (x >= (sizeof (records) / sizeof (records[0]))) {
@@ -769,7 +760,7 @@ static uint32_t incModRecords (uint32_t x) {
     return x;
 }
 
-// Queue a telemetry report
+/// Queue a telemetry report.
 static void queueTelemetryReport() {
     char *pRecord;
     uint32_t contentsIndex = 0;
@@ -810,7 +801,7 @@ static void queueTelemetryReport() {
     Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
-// Queue a GPS report
+/// Queue a GPS report.
 static void queueGpsReport(float latitude, float longitude) {
     char *pRecord;
     uint32_t contentsIndex = 0;
@@ -841,7 +832,7 @@ static void queueGpsReport(float latitude, float longitude) {
     Serial.printf ("%d byte(s) of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
-// Queue a stats report
+/// Queue a stats report.
 static void queueStatsReport() {
     char *pRecord;
     uint32_t contentsIndex = 0;
@@ -866,7 +857,7 @@ static void queueStatsReport() {
             contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ".%02d", r.fatalList[x]); // -1 for terminator
         }
     }
-    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+    if ((contentsIndex < 0) || (contentsIndex >= LEN_RECORD)) {
         Serial.println("WARNING: couldn't fit fatal count and types into report.");
     }
     
@@ -933,7 +924,38 @@ static void queueStatsReport() {
     Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
-// Check that all is OK with static memory, as far as we can
+/// Calculate the number of seconds to the start of the working day.
+static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
+    uint32_t seconds;
+    
+    // We're awake outside the working day, calculate the new wake-up time
+    if (secondsToday < START_OF_WORKING_DAY_SECONDS) {
+        seconds = START_OF_WORKING_DAY_SECONDS - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+    } else {
+        // Must be after the end of the day, so wake up next tomorrow morning
+        seconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+    }
+    
+    // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
+    if (Time.now() + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+        seconds += SLOW_MODE_INTERVAL_SECONDS;
+    }
+
+    if (seconds > 0) {
+        Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d seconds in order to wake up at %s.\n",
+                      Time.hour(), Time.minute(), Time.second(),
+                      Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
+                      Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
+                      Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
+                      seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+    } else {
+        seconds = 0;
+    }
+    
+    return seconds;
+}
+
+/// Check that all is OK with static memory, as far as we can.
 static void checkIntegrity() {
     ASSERT(strcmp(r.guard0, GUARD_STRING) == 0, FATAL_TYPE_STATIC_MEMORY_UNDERRUN);
     ASSERT(strcmp(r.guard1, GUARD_STRING) == 0, FATAL_TYPE_STATIC_MEMORY_OVERRUN);
@@ -947,8 +969,6 @@ static void checkIntegrity() {
 
 void setup() {
     char guard[] = {GUARD_STRING};
-    
-    gotToSetup = true;
     
     // Set up retained memory, if required
     if (strcmp (r.key, RETAINED_INITIALISED) != 0) {
@@ -1020,6 +1040,9 @@ void setup() {
 
 void loop() {
     char guard[] = {"DEADAREA"};
+    time_t sleepForSeconds = 0;
+    bool inMotion;
+    bool forceSend = false;
     bool modemStaysAwake = false;
     bool atLeastOneGpsReportSent = false;
     time_t gpsOnTime = 0;
@@ -1030,9 +1053,8 @@ void loop() {
    // This only for info
     r.numLoops++;
     
-    // Check here if the interrupt occurred, nice and calm,
-    // outside interrupt context
-    handleInterrupt();
+    // Check here if the accelerometer interrupt occurred
+    inMotion = handleInterrupt();
 
     if (!firstTime) {
 #ifdef DISABLE_ACCELEROMETER
@@ -1042,7 +1064,7 @@ void loop() {
         if (inMotion && (Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
             gpsOnTime = gpsOn();
         }
-        
+
         // It seems counterintuitive to add a delay here but, if you don't
         // then, on wake-up from sleep, one or other of the calls below
         // stalls for some time (maybe one of the serial functions) and so
@@ -1054,13 +1076,13 @@ void loop() {
     // has not been established (via a connection to the Particle server),
     // try to establish it again
     if (establishTime()) {
-        
-        // Total up the time we were in power save mode (for info)
+
+        // Add up the time we were in power save mode (for info)
         if (r.powerSaveTime != 0) {
             r.totalPowerSaveSeconds += Time.now() - r.powerSaveTime;
             r.powerSaveTime = 0;
         }
-        
+
         // Check if we should be awake at all
         if (Time.now() >= START_TIME_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
             uint32_t secondsSinceMidnight = Time.hour() * 3600 + Time.minute() * 60 + Time.second();
@@ -1070,21 +1092,21 @@ void loop() {
                 Serial.println("WARNING: trying to get IMEI again...");
                 Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
             }
-                    
+
             // Check if we are inside the working day
             if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) &&
                 (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS)) {
-                    
+
                 modemStaysAwake = true;
-                
+
                 // Is it time to do something?
                 if (firstTime || (Time.now() >= r.sleepTime + WAKEUP_PERIOD_SECONDS)) {
                     Serial.printf("\nAwake: time now is %s UTC, slept since %s UTC (%d second(s) ago).\n",
                                   Time.timeStr().c_str(), Time.timeStr(r.sleepTime).c_str(), Time.now() - r.sleepTime);
-                                  
+
                     // Set the default sleep time after we've done stuff
                     sleepForSeconds = WAKEUP_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-                    
+
                     // Queue a telemetry report, if required
                     if (Time.now() - lastTelemetrySeconds >= TELEMETRY_PERIOD_SECONDS) {
                         lastTelemetrySeconds = Time.now();
@@ -1092,7 +1114,7 @@ void loop() {
                         Serial.println("Forcing a send.");
                         forceSend = true;
                     }
-                    
+
                     // Queue a GPS report, if required
                     if ((Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
                         r.numLoopsLocationNeeded++;
@@ -1116,7 +1138,7 @@ void loop() {
                             // Reset the flag
                             inMotion = false;
                         }
-                    
+
                         // If we have a valid reading (either a new one if we're moving, or the
                         // previous one if we haven't moved) then queue a report
 #ifdef IGNORE_INVALID_GPS
@@ -1128,7 +1150,7 @@ void loop() {
                             queueGpsReport(lastLatitude, lastLongitude);
                         }
                     }
-                    
+
                     // Queue a stats report, if required
                     if (Time.now() - lastStatsSeconds >= STATS_PERIOD_SECONDS) {
                         lastStatsSeconds = Time.now();
@@ -1141,12 +1163,12 @@ void loop() {
                         uint32_t failedCount = 0;
                         uint32_t x;
                         bool sendStatsReport = false;
-                
+
                         if (forceSend) {
                             Serial.println ("Force Send was set.");
                         }
                         forceSend = false;
-                        
+
 #ifdef ENABLE_STATS_REPORTING
                         sendStatsReport = true;
 #endif
@@ -1199,12 +1221,12 @@ void loop() {
                             } else {
                                 Serial.println("unused.");
                             }
-                            
+
                             // Increment x
                             x = incModRecords(x);
-                            
+
                         } while (x != incModRecords(currentRecord));  // Loop until we've gone beyond the current record
-                        
+
                         Serial.printf("%ld report(s) sent, %ld failed to send.\n", sentCount, failedCount);
                         // If there's been a publish failure and nextPubRecord is
                         // equal to currentRecord then we must have wrapped.  In this
@@ -1212,54 +1234,39 @@ void loop() {
                         if ((failedCount > 0) && (nextPubRecord == currentRecord)) {
                             nextPubRecord = incModRecords(nextPubRecord);
                         }
-                        
+
                         lastReportSeconds = Time.now();
                     }
-            
+
                     // If were still in slow operation and at least one GPS report has been sent, or we've
                     // timed out on getting a GPS fix during this slow operation wake-up, then we can go to
                     // deep sleep until the interval expires
                     if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
                         if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
                             modemStaysAwake = false;
-                            sleepForSeconds = ((secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS + SLOW_MODE_INTERVAL_SECONDS) % SLOW_MODE_INTERVAL_SECONDS) - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+                            uint32_t numIntervalsPassed = (secondsSinceMidnight - (START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS)) / SLOW_MODE_INTERVAL_SECONDS;
+                            sleepForSeconds = (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                             if (sleepForSeconds < 0) {
                                 sleepForSeconds = 0;
                             }
+                            // If we would be waking up after the end of the working day, have a proper sleep instead
+                            if (Time.now() + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+                                sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
+                            }
                         }
                     }
+
                     // Back to sleep now
                     r.sleepTime = Time.now();
-                }  // if() we need to do something
+                } // if() we need to do something
             } else {
-                // We're awake outside the working day, calculate the new wake-up time
-                if (secondsSinceMidnight < START_OF_WORKING_DAY_SECONDS) {
-                    sleepForSeconds = START_OF_WORKING_DAY_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-                } else {
-                    // Must be after the end of the day, so wake up next tomorrow morning
-                    sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-                }
-                
-                // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
-                if (Time.now() + sleepForSeconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
-                    sleepForSeconds += SLOW_MODE_INTERVAL_SECONDS;
-                }
-
-                if (sleepForSeconds > 0) {
-                    Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d seconds in order to wake up at %s.\n",
-                                  Time.hour(), Time.minute(), Time.second(),
-                                  Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
-                                  Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
-                                  Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
-                                  sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS, Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
-                } else {
-                    sleepForSeconds = 0;
-                }
+                // We're awake outside of the working day, calculate the time to the start of the working day
+                sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
             } // else condition of if() it's time to do something
         } else {
             // We're awake when we shouldn't have started operation at all yet, calculate new wake-up time
             sleepForSeconds = START_TIME_UNIX_UTC - Time.now() - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-            
+
             // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
             if (Time.now() + sleepForSeconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
                 sleepForSeconds += SLOW_MODE_INTERVAL_SECONDS;
@@ -1272,17 +1279,19 @@ void loop() {
             } else {
                 sleepForSeconds = 0;
             }
-            
+
             // Also, clear the retained variables as we'd like a fresh start when we awake
             resetRetained();
         } // else condition of if() time >= START_TIME_UNIX_UTC
-        
+
         // Record the time we went into power saving state (only if we have established time though)
         r.powerSaveTime = Time.now();
-        
+
     } else {
         Serial.printf("WARNING: unable to establish time (time now is %d).\n", Time.now());
         sleepForSeconds = TIME_SYNC_RETRY_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+        // Keep the modem awake in this case as we really want to establish network time
+        modemStaysAwake = true;
     } // else condition of if() network time has been established
 
     Serial.printf("Loop %ld: now sleeping for %ld second(s) (will awake at %s UTC), modem will be ",
@@ -1324,7 +1333,7 @@ void loop() {
         accelerometer.disableInterrupts();
         System.sleep(SLEEP_MODE_DEEP, sleepForSeconds);
     }
- 
+
     // It is no longer our first time
     firstTime = false;
 
