@@ -191,22 +191,23 @@
 // If the device wakes up before this time it will return
 // to deep sleep.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
-#define START_TIME_UNIX_UTC 1466492400 // 21 June 2016 @ 07:00 UTC
+#define START_TIME_UNIX_UTC 1466586000 // 22 June 2016 @ 09:00 UTC
 
 /// The number of times to wake-up during the working day when in slow operation.
-#define SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY 2
+#define SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY 1
 
 /// The maximum amount of time to wait for a GPS fix to be established while we are in
 // slow operation.  After this time, or as soon as a GPS fix has been established
 // and transmitted, we can go to deep sleep.
-#define SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS (60 * 10)
+#define SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS (60 * 5)
 
 /// The start time for full working day operation (in Unix, UTC).
 // After this time the device will be awake for the whole working day and send reports
 // as necessary.
 // This time must be later than or equal to START_TIME_UNIX_UTC.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
-#define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1468134000 // 10 July 2016 @ 07:00 UTC
+//#define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1468134000 // 10 July 2016 @ 07:00 UTC
+#define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1466586000 // 22 June 2016 @ 09:00 UTC
 
 /// Start of day in seconds after midnight UTC.
 #define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00 UTC, so 08:00 BST
@@ -707,6 +708,8 @@ static bool establishTime() {
             // reset it to a more correct time here.
             setupCompleteSeconds = Time.now();
         }
+    } else {
+        Serial.printf("WARNING: unable to establish time (time now is %d).\n", Time.now());
     }
 
     return success;
@@ -798,7 +801,7 @@ static void queueTelemetryReport() {
         Serial.println("WARNING: couldn't fit timestamp into report.");
     }
     
-    Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    Serial.printf ("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /// Queue a GPS report.
@@ -829,7 +832,7 @@ static void queueGpsReport(float latitude, float longitude) {
         Serial.println("WARNING: couldn't fit timestamp into report.");
     }
     
-    Serial.printf ("%d byte(s) of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    Serial.printf ("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /// Queue a stats report.
@@ -921,33 +924,38 @@ static void queueStatsReport() {
         Serial.println("WARNING: couldn't fit timestamp into report.");
     }
     
-    Serial.printf ("%d bytes of record used (%d unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    Serial.printf ("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /// Calculate the number of seconds to the start of the working day.
 static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
-    uint32_t seconds;
+    uint32_t seconds = 0;
     
     // We're awake outside the working day, calculate the new wake-up time
     if (secondsToday < START_OF_WORKING_DAY_SECONDS) {
         seconds = START_OF_WORKING_DAY_SECONDS - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
     } else {
-        // Must be after the end of the day, so wake up next tomorrow morning
-        seconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+        if (secondsToday > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
+            // After the end of the day, so wake up next tomorrow morning
+            seconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+        }
     }
     
-    // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
-    if (Time.now() + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
-        seconds += SLOW_MODE_INTERVAL_SECONDS;
-    }
-
     if (seconds > 0) {
-        Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d seconds in order to wake up at %s.\n",
+        Serial.printf("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d second(s) in order to wake up at %s.\n",
                       Time.hour(), Time.minute(), Time.second(),
                       Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
                       Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
                       Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
                       seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+        // If we will still be in slow mode when we awake, no need to wake up until the first slow-operation
+        // wake-up time
+        if (Time.now() + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+            seconds += SLOW_MODE_INTERVAL_SECONDS;
+            Serial.printf("Adding %d second(s) to this as we're in slow operation mode, so will actually wake up at %s.\n",
+                           SLOW_MODE_INTERVAL_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+        }
+    
     } else {
         seconds = 0;
     }
@@ -1007,7 +1015,7 @@ void setup() {
 
     // After a reset of the Electron board it takes a Windows PC several seconds
     // to sort out what's happened to its USB interface, hence you need this
-    // delay if you're going to capture the serial output completely.
+    // delay if you're going to capture the serial output completely
     delay (5000);
     
     // Connect to the network so as to establish time
@@ -1066,7 +1074,7 @@ void loop() {
         }
 
         // It seems counterintuitive to add a delay here but, if you don't
-        // then, on wake-up from sleep, one or other of the calls below
+        // then, on wake-up from System.sleep(), one or other of the calls below
         // stalls for some time (maybe one of the serial functions) and so
         // it actually saves power to wait a little while here.
         delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
@@ -1094,8 +1102,8 @@ void loop() {
             }
 
             // Check if we are inside the working day
-            if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) &&
-                (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS)) {
+            if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS) &&
+                (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS)) {
 
                 modemStaysAwake = true;
 
@@ -1174,7 +1182,7 @@ void loop() {
 #endif
                         // Publish any records that are marked as used
                         x = nextPubRecord;
-                        Serial.printf("Sending reports (numRecordsQueued %d, nextPubRecord %d, currentRecord %d).\n", numRecordsQueued, x, currentRecord);
+                        Serial.printf("Sending report(s) (numRecordsQueued %d, nextPubRecord %d, currentRecord %d).\n", numRecordsQueued, x, currentRecord);
 
                         do {
                             ASSERT (x < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_3);
@@ -1241,16 +1249,16 @@ void loop() {
                     // If were still in slow operation and at least one GPS report has been sent, or we've
                     // timed out on getting a GPS fix during this slow operation wake-up, then we can go to
                     // deep sleep until the interval expires
-                    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+                    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
                         if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
                             modemStaysAwake = false;
-                            uint32_t numIntervalsPassed = (secondsSinceMidnight - (START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS)) / SLOW_MODE_INTERVAL_SECONDS;
-                            sleepForSeconds = (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+                            uint32_t numIntervalsPassed = (secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS) / SLOW_MODE_INTERVAL_SECONDS;
+                            sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                             if (sleepForSeconds < 0) {
                                 sleepForSeconds = 0;
                             }
                             // If we would be waking up after the end of the working day, have a proper sleep instead
-                            if (Time.now() + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+                            if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
                                 sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
                             }
                         }
@@ -1288,7 +1296,6 @@ void loop() {
         r.powerSaveTime = Time.now();
 
     } else {
-        Serial.printf("WARNING: unable to establish time (time now is %d).\n", Time.now());
         sleepForSeconds = TIME_SYNC_RETRY_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
         // Keep the modem awake in this case as we really want to establish network time
         modemStaysAwake = true;
@@ -1308,6 +1315,7 @@ void loop() {
     
     // Leave a little time for serial prints to leave the building before sleepy-byes
     delay (500);
+    
     // Now go to sleep for the allotted time.  If the accelerometer interrupt goes
     // off it will be flagged and dealt with when we're good and ready, hence we sleep
     // listening to a pin that is an output and always low.
@@ -1320,18 +1328,20 @@ void loop() {
     // stupid level (otherwise it would waste power) and go back to sleep again if
     // some back-off interval had not been met.  Too complicated, better to keep things
     // simple; our GPS fix interval is short enough at 30 seconds in any case.
-    if (modemStaysAwake) {
-        // If we're in normal working-day operation, sleep with the network connection up so
-        // that we can send reports.
-        System.sleep(D3, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
-   } else {
-        // Nice deep sleep otherwise, making sure that GPS is off so that we
-        // don't get interrupted
-        // NOTE: we will come back from reset after this, only the
-        // retained variables will be kept
-        gpsOff();
-        accelerometer.disableInterrupts();
-        System.sleep(SLEEP_MODE_DEEP, sleepForSeconds);
+    if (sleepForSeconds > 0) {
+        if (modemStaysAwake) {
+            // If we're in normal working-day operation, sleep with the network connection up so
+            // that we can send reports.
+            System.sleep(D3, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
+       } else {
+            // Nice deep sleep otherwise, making sure that GPS is off so that we
+            // don't get interrupted
+            // NOTE: we will come back from reset after this, only the
+            // retained variables will be kept
+            gpsOff();
+            accelerometer.disableInterrupts();
+            System.sleep(SLEEP_MODE_DEEP, sleepForSeconds);
+        }
     }
 
     // It is no longer our first time
