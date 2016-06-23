@@ -190,12 +190,10 @@ bool Accelerometer::begin(void)
                               ACCELEROMETER_ADDRESS, data[0]);
             }
         } else {
-            Serial.printf("Accelerometer: I2C address 0x%02x, timeout reading value of register 0x%02x.\n",
-                          ACCELEROMETER_ADDRESS, data[0]);
+            Serial.printf("Accelerometer: I2C address 0x%02x, timeout reading value of register 0x00.\n", ACCELEROMETER_ADDRESS);
         }
     } else {
-        Serial.printf("Accelerometer: I2C address 0x%02x, unable to write the address of register 0x%02x.\n",
-                      ACCELEROMETER_ADDRESS, data[0]);
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to write the address of register 0x00.\n", ACCELEROMETER_ADDRESS);
     }
 
     // For debug purposes

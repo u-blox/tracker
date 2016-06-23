@@ -24,6 +24,13 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "TinyGPS.h"
 #include <math.h>
 
+/// u-blox: added this switch so that GPRMC can be disabled.
+// The reason for this is that we need the HDOP information but
+// the HDOP information is only in the GPGGA sentence.  If the
+// GPRMC sentence happens to be captured before the GPGGA sentence
+// then HDOP will be missing
+//#define ENABLE_GPRMC
+
 #define _GPRMC_TERM   "GPRMC"
 #define _GPGGA_TERM   "GPGGA"
 
@@ -190,6 +197,7 @@ bool TinyGPS::term_complete()
 
         switch(_sentence_type)
         {
+#ifdef ENABLE_GPRMC
         case _GPS_SENTENCE_GPRMC:
           _time      = _new_time;
           _date      = _new_date;
@@ -198,6 +206,7 @@ bool TinyGPS::term_complete()
           _speed     = _new_speed;
           _course    = _new_course;
           break;
+#endif          
         case _GPS_SENTENCE_GPGGA:
           _altitude  = _new_altitude;
           _time      = _new_time;
