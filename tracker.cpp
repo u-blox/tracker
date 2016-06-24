@@ -141,14 +141,20 @@
  * to the WKP pin of the Electron board, on the assumption that
  * we could use that feature or disable it by using a "null"
  * (i.e. set to an output and to low) pin in the System.sleep() call.
- * However the Particle documentation is incorrect, the Electron
+ * D3 is used for this purpose.  However, in revision 0.5.1 of
+ * the Particle software (fixed in 0.6.0 apparently), the Electron
  * board will *always* wakeup with an edge on the WKP pin
- * *whatever* pin is specified in the System.sleep() call.
- * Hence, having decided not to use the accelerometer interrupt,
- * it was necessary to disable interrupts from the accelerometer
- * board itself during sleep.  I could, of course, disable them
- * always and diff the X/Y/Z readings but that wouldn't capture
- * motion that occurred only while the Electron board was asleep.
+ * *whatever* pin is specified in the System.sleep() call.  Even
+ * once this is fixed, the WKP pin will always wake up the system
+ * from deep sleep, whatever else you do.  So, having decided not
+ * to use the accelerometer interrupt, it was necessary to disable
+ * interrupts from the accelerometer board itself during sleep.
+ * I could, of course, disable them always and diff the X/Y/Z
+ * readings but that wouldn't capture motion that occurred while
+ * the Electron board was asleep. If I were having the board made
+ * again I would route INT1 from the accelerometer to D4, in case
+ * I needed it again, and connect the Electron's WKP pin firmly to
+ * ground.
  */
 
 /****************************************************************
@@ -235,8 +241,8 @@
 /// Duration of a working day in seconds.
 #define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 10) // 10 hours, so day ends at 17:00 UTC (18:00 BST)
 
-/// The accelerometer interrupt threshold (in units of 62.5 mg).
-#define ACCELEROMETER_INTERRUPT_THRESHOLD 16
+/// The accelerometer activity threshold (in units of 62.5 mg).
+#define ACCELEROMETER_ACTIVITY_THRESHOLD 10
 
 /****************************************************************
  * CONDITIONAL COMPILATION OPTIONS
@@ -468,7 +474,7 @@ static char * getRecord(RecordType_t type);
 static void freeRecord(Record_t *pRecord);
 static uint32_t incModRecords (uint32_t x);
 static void queueTelemetryReport();
-static void queueGpsReport(float latitude, float longitude, bool inMotion, uint32_t hdop);
+static void queueGpsReport(float latitude, float longitude, bool motion, uint32_t hdop);
 static void queueStatsReport();
 static bool sendQueuedReports();
 static uint32_t secondsToWorkingDayStart(uint32_t secondsToday);
@@ -829,7 +835,7 @@ static void queueTelemetryReport() {
 }
 
 /// Queue a GPS report.
-static void queueGpsReport(float latitude, float longitude, bool inMotion, uint32_t hdop) {
+static void queueGpsReport(float latitude, float longitude, bool motion, uint32_t hdop) {
     char *pRecord;
     uint32_t contentsIndex = 0;
 
@@ -858,7 +864,7 @@ static void queueGpsReport(float latitude, float longitude, bool inMotion, uint3
     
     // Add motion to the end, to preserve backwards-compatibility
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d", inMotion);  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d", motion);  // -1 for terminator
     } else {
         Serial.println("WARNING: couldn't fit motion indication into report.");
     }
@@ -1114,6 +1120,10 @@ void setup() {
     digitalWrite (D2, HIGH);
     gpsOn();
 
+    // Use D3 as a "null" pin that will not generate any activity at all
+    pinMode(D3, OUTPUT);
+    digitalWrite (D3, LOW);
+    
     // After a reset of the Electron board it takes a Windows PC several seconds
     // to sort out what's happened to its USB interface, hence you need this
     // delay if you're going to capture the serial output completely
@@ -1129,7 +1139,7 @@ void setup() {
     // Set up all the necessary accelerometer bits
     accelerometerConnected = accelerometer.begin();
     if (accelerometerConnected) {
-        accelerometer.setActivityThreshold(ACCELEROMETER_INTERRUPT_THRESHOLD);
+        accelerometer.setActivityThreshold(ACCELEROMETER_ACTIVITY_THRESHOLD);
         accelerometer.enableInterrupts();
     }
 #endif
@@ -1162,7 +1172,7 @@ void loop() {
     
     // Check here if the accelerometer interrupt occurred
     inMotion = handleInterrupt();
-
+    
     if (!firstTime) {
         // Switch GPS on early so that it can get fixing.
         if (inMotion && (Time.now() - lastGpsSeconds >= GPS_PERIOD_SECONDS)) {
@@ -1173,6 +1183,7 @@ void loop() {
         // then, on wake-up from System.sleep(), one or other of the calls below
         // stalls for some time (maybe one of the serial functions) and so
         // it actually saves power to wait a little while here.
+        // Also, Serial prints before this point in loop() likely won't appear.
         delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
     }
 
@@ -1263,9 +1274,6 @@ void loop() {
                             lastGpsSeconds = Time.now();
                             queueGpsReport(lastLatitude, lastLongitude, inMotion, lastHdop);
                         }
-                        
-                        // Reset the inMotion flag
-                        inMotion = false;
                     }
 
                     // Queue a stats report, if required
@@ -1292,12 +1300,14 @@ void loop() {
                         if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
                             modemStaysAwake = false;
                             uint32_t numIntervalsPassed = (secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS) / SLOW_MODE_INTERVAL_SECONDS;
-                            sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS - secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+                            sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
+                                              secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
                             if (sleepForSeconds < 0) {
                                 sleepForSeconds = 0;
                             }
                             // If we would be waking up after the end of the working day, have a proper sleep instead
-                            if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+                            if (secondsSinceMidnight + sleepForSeconds >
+                                START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
                                 sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
                             }
                         }
@@ -1368,31 +1378,28 @@ void loop() {
     // some back-off interval had not been met.  Too complicated, better to keep things
     // simple; our GPS fix interval is short enough at 30 seconds in any case.
     if (sleepForSeconds > 0) {
-        // NOTE: the Particle documentation is incorrect when it says that the pin specified
-        // in the System.sleep() call is the "specific interrupt" that will wake up from
-        // sleep.  In fact the system will ALWAYS wake-up if the WKP pin or, as far as I know,
-        // any other interrupt source, is toggled.  Hence, having decided that I don't want
-        // to be woken up by an interrupt after all, the interrupt needs to be disabled
-        // at the accelerometer end.
-        if (accelerometerConnected) {
-            accelerometer.disableInterrupts();
-        }
-        
         if (modemStaysAwake) {
             // If we're in normal working-day operation, sleep with the network connection up so
-            // that we can send reports.
-            System.sleep(WKP, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
+            // that we can send reports
+            // NOTE: in revision 0.5.1 of the Particle software, when it says that the pin
+            // specified in the System.sleep() call is the "specific interrupt" that will
+            // wake up from sleep, that is incorrect.  In fact the system will also ALWAYS
+            // wake-up if the WKP pin is toggled.  Hence we have to force ourselves back to
+            // bed if we've woken up early.   This will be fixed in revision 0.6.0 I'm told.
+            time_t t = Time.now();
+            while (Time.now() < t + sleepForSeconds) {
+                System.sleep(D3, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
+            }
         } else {
             // Nice deep sleep otherwise, making sure that GPS is off so that we
-            // don't get interrupted
+            // don't use power and the accelerometer can't interrupt us.
             // NOTE: we will come back from reset after this, only the
             // retained variables will be kept
+            if (accelerometerConnected) {
+                accelerometer.disableInterrupts();
+            }
             gpsOff();
             System.sleep(SLEEP_MODE_DEEP, sleepForSeconds);
-        }
-        
-        if (accelerometerConnected) {
-            accelerometer.enableInterrupts();
         }
     }
 
