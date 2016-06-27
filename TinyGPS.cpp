@@ -197,7 +197,6 @@ bool TinyGPS::term_complete()
 
         switch(_sentence_type)
         {
-#ifdef ENABLE_GPRMC
         case _GPS_SENTENCE_GPRMC:
           _time      = _new_time;
           _date      = _new_date;
@@ -206,7 +205,6 @@ bool TinyGPS::term_complete()
           _speed     = _new_speed;
           _course    = _new_course;
           break;
-#endif          
         case _GPS_SENTENCE_GPGGA:
           _altitude  = _new_altitude;
           _time      = _new_time;
@@ -232,7 +230,11 @@ bool TinyGPS::term_complete()
   if (_term_number == 0)
   {
     if (!gpsstrcmp(_term, _GPRMC_TERM))
+#ifdef ENABLE_GPRMC
       _sentence_type = _GPS_SENTENCE_GPRMC;
+#else 
+    ;
+#endif      
     else if (!gpsstrcmp(_term, _GPGGA_TERM))
       _sentence_type = _GPS_SENTENCE_GPGGA;
     else
