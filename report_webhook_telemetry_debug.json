@@ -1,0 +1,8 @@
+{
+    "eventName": "telemetry",
+    "url": "http://ciot.it-sgn.u-blox.com:5050",
+    "requestType": "PUT",
+    "json": {"telemetry": "{{PARTICLE_EVENT_VALUE}}"},
+    "mydevices": true,
+    "noDefaults": true
+}

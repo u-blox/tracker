@@ -1,0 +1,8 @@
+{
+    "eventName": "stats",
+    "url": "http://ciot.it-sgn.u-blox.com:5050",
+    "requestType": "PUT",
+    "json": {"stats": "{{PARTICLE_EVENT_VALUE}}"},
+    "mydevices": true,
+    "noDefaults": true
+}
