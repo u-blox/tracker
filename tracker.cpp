@@ -155,7 +155,7 @@
 
 #ifdef DEV_BUILD
 /// Enable stats reporting.
-#define ENABLE_STATS_REPORTING
+# define ENABLE_STATS_REPORTING
 #endif
 
 /// Define this to do GPS readings irrespective of the state of the
@@ -275,14 +275,35 @@
 #define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00 UTC, so 08:00 BST
 
 /// Duration of a working day in seconds.
-#define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 10) // 10 hours, so day ends at 17:00 UTC (18:00 BST)
+# define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 10) // 10 hours, so day ends at 17:00 UTC (18:00 BST)
 
 /// The accelerometer activity threshold (in units of 62.5 mg).
 // NOTE: this is extremely sensitive, likely to over-trigger.  A more relaxed value would be
 // 10 or 16.
 #define ACCELEROMETER_ACTIVITY_THRESHOLD 3
 
-/****************************************************************
+/// GPS module power on delay
+#define GPS_POWER_ON_DELAY_MILLISECONDS 500
+
+/// How long to wait for responses from the GPS module after sending commands
+#define GPS_DELAY_MILLISECONDS 100
+
+/// How long to wait for an Ack message back from the GPS module
+#define GPS_WAIT_FOR_ACK_MILLISECONDS 3000
+
+/// How long to wait for non-ack responses from the GPS module
+#define GPS_WAIT_FOR_RESPONSE_MILLISECONDS 2000
+
+/// Allow a gap between characters read from GPS when in command/response mode
+#define GPS_INTER_CHARACTER_DELAY_MILLISECONDS 50
+
+/// The offset at the start of a UBX protocol message
+#define GPS_UBX_PROTOCOL_HEADER_SIZE 6
+
+/// The minimum number of satellites for which we want to have ephemeris data
+#define GPS_MIN_NUM_EPHEMERIS_DATA 5
+
+/***************************************************************
  * OTHER MACROS
  ***************************************************************/
 
@@ -338,6 +359,7 @@ typedef enum {
     DEBUG_IND_GPS_FIX,
     DEBUG_IND_ACTIVITY,
     DEBUG_IND_RETAINED_RESET,
+    DEBUG_IND_BOOT_COMPLETE,
     MAX_NUM_DEBUG_INDS
 } DebugInd_t;
 
@@ -456,6 +478,14 @@ retained Retained_t r;
 /// Record if we're currently in motion.
 bool inMotion = false;
 
+/// A general purpose buffer, used for sending
+// and receiving UBX commands to/from the GPS module
+uint8_t msgBuffer[1024];
+
+/// For hex printing
+static const char hexTable[] =
+{ '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+
 /// Instantiate GPS.
 TinyGPS gps;
 
@@ -480,21 +510,26 @@ STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
 #define ASSERT(condition, fatalType) {if (!(condition)) {FATAL(fatalType)}}
 
 #ifdef USB_DEBUG
-#define LOG(...) Serial.printf(__VA_ARGS__)
+#define LOG_MSG(...) Serial.printf(__VA_ARGS__)
 #else
-#define LOG(...)
+#define LOG_MSG(...)
 #endif
 
 /****************************************************************
  * FUNCTION PROTOTYPES
  ***************************************************************/
 
-static void resetRetained();
 static bool handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
-static int getImeiCallBack(int type, const char* pBuf, int len, char* imei);
+static int getImeiCallBack(int type, const char* pBuf, int len, char * pImei);
+static void printHex(const char *pBytes, uint32_t lenBytes);
+int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck);
+static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds);
+static bool configureGps();
+static bool canGpsPowerSave();
+static void resetRetained();
 static time_t gpsOn();
-static void gpsOff();
+static bool gpsOff();
 static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude, uint32_t *pHdop, uint32_t *pAgeMilliseconds);
 static void updateTotalGpsSeconds();
 static bool connect();
@@ -521,14 +556,6 @@ static void resetRetained() {
 
 /// Handle the accelerometer interrupt, returning true if activity
 // was detected, otherwise false.
-// NOTE: though we set-up interrupts and read the interrupt registers
-// on the ADXL345 chip, and the ADXL345 INT1 line is wired to the
-// WKP pin on the Electron board, we don't use the interrupt to wake
-// us up.  Instead we wake-up at a regular interval and then check
-// with this function whether the interrupt went off or not.  This
-// stops us waking up all the time and allows us to set a nice
-// low threshold for activity, so that we can be sure we wake-up, but
-// still send GPS readings at sensible intervals.
 static bool handleInterrupt() {
     bool activityDetected = false;
     
@@ -552,11 +579,11 @@ static bool handleInterrupt() {
 }
 
 /// Parse the IMEI from the module.
-static int getImeiCallBack(int type, const char* pBuf, int len, char* imei) {
+static int getImeiCallBack(int type, const char* pBuf, int len, char* pImei) {
     
-    if ((type == TYPE_UNKNOWN) && imei) {
-        if (sscanf(pBuf, "\r\n%15s\r\n", imei) == 1) {
-            LOG("IMEI is: %.*s.\n", IMEI_LENGTH, imei);
+    if ((type == TYPE_UNKNOWN) && (pImei != NULL)) {
+        if (sscanf(pBuf, "\r\n%15s\r\n", pImei) == 1) {
+            LOG_MSG("IMEI is: %.*s.\n", IMEI_LENGTH, pImei);
         }
     }
 
@@ -605,30 +632,392 @@ static void debugInd(DebugInd_t debugInd) {
             digitalWrite(D7, LOW);
             delay (25);
         break;
+        case DEBUG_IND_BOOT_COMPLETE:
+            // Three long flashes
+            digitalWrite(D7, LOW);
+            delay (250);
+            digitalWrite(D7, HIGH);
+            delay (500);
+            digitalWrite(D7, LOW);
+            delay (250);
+            digitalWrite(D7, HIGH);
+            delay (500);
+            digitalWrite(D7, LOW);
+            delay (250);
+            digitalWrite(D7, HIGH);
+            delay (500);
+            digitalWrite(D7, LOW);
+            delay (250);
+        break;
         default:
         break;
     }
 }
 
+/// Print an array of bytes as hex
+static void printHex(const uint8_t *pBytes, uint32_t lenBytes)
+{
+    char hexChar[2];
+
+    for (uint32_t x = 0; x < lenBytes; x++)
+    {
+        hexChar[0] = hexTable[(*pBytes >> 4) & 0x0f]; // upper nibble
+        hexChar[1] = hexTable[*pBytes & 0x0f]; // lower nibble
+        pBytes++;
+        LOG_MSG("%.2s-", hexChar);
+    }
+}
+
+/// Send a u-blox format message to the GPS module
+int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck)
+{
+    uint8_t head[6] = {0xB5, 0x62, msgClass, msgId, (uint8_t) (msgLen >> 0), (uint8_t) (msgLen >> 8)};
+    uint8_t crc[2];
+    uint32_t i;
+    uint32_t ca = 0;
+    uint32_t cb = 0;
+
+    for (i = 2; i < 6; i ++)
+    {
+        ca += head[i];
+        cb += ca;
+    }
+    
+    for (i = 0; i < msgLen; i ++)
+    {
+        ca += *((uint8_t *) pBuf + i);
+        cb += ca; 
+    }
+    
+    LOG_MSG("Sending %d bytes: ", msgLen + sizeof (head) + sizeof (crc));
+    i = Serial1.write(head, sizeof(head));
+    printHex(head, sizeof(head));
+    if (pBuf != NULL) {
+        i += Serial1.write((uint8_t *) pBuf, msgLen);
+        printHex((uint8_t *) pBuf, msgLen);
+    }
+    
+    crc[0] = ca & 0xFF;
+    crc[1] = cb & 0xFF;
+    i += Serial1.write(crc, sizeof(crc));
+    printHex(crc, sizeof(crc));
+    
+    LOG_MSG("\n");
+    
+    if (i < msgLen + sizeof (head) + sizeof (crc)) {
+        LOG_MSG("WARNING: not all bytes were sent.\n");
+    }
+    
+    // Check the ack if requested
+    // See ublox7-V14_ReceiverDescrProtSpec section 33 (ACK)
+    if (checkAck) {
+        uint8_t buffer[32];
+        bool gotAckOrNack = false;
+        uint32_t t;
+        
+        t = millis();
+        LOG_MSG("  > ");
+        
+        // Wait around for a message that is an ack
+        while (!gotAckOrNack && (millis() - t < GPS_WAIT_FOR_ACK_MILLISECONDS)) {
+            if (readGpsMsg(buffer, sizeof (buffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) == 10) { // 10 is the Ack message size
+                // Ack is  0xb5-62-05-00-02-00-msgclass-msgid-crcA-crcB
+                // Nack is 0xb5-62-05-01-02-00-msgclass-msgid-crcA-crcB
+                if ((buffer[4] == 2) && (buffer[5] == 0) && (buffer[6] == msgClass) && (buffer[7] == msgId) && (buffer[2] == 0x05)) {
+                    gotAckOrNack = true;
+                    if (buffer[3] != 0x01) {
+                        i = -1;
+                        LOG_MSG("!!> [Nack]\n");
+                    } else {
+                        LOG_MSG("  > [Ack]\n");
+                    }
+                }
+            }
+        }
+        
+        if (!gotAckOrNack) {
+            i = -2;
+            LOG_MSG("\n!!> [No Ack]\n");
+        }
+    }
+    
+    return i;
+}
+
+/// Read a UBX format GPS message into a buffer.  If waitMilliseconds
+// is zero then don't hang around except for the intercharacter delay,
+// otherwise wait up to that number of milliseconds for the message
+static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds) {
+    uint32_t x = 0;
+    uint16_t msgLen = 0;
+    uint32_t ca = 0;
+    uint32_t cb = 0;
+    bool save;
+    bool checksum;
+    uint8_t checksumState = 0;
+    uint32_t t = millis();
+        
+    do {
+        while (Serial1.available() && (checksumState != 2) && (x < bufferLen)) {
+            save = false;
+            checksum = false;
+            uint8_t c = Serial1.read();
+            if ((x == 0) && (c == 0xb5)) {
+                // First header byte
+                save = true;
+            } else if ((x == 1) && (c == 0x62)) {
+                // Second header byte
+                save = true;
+            } else if (x == 2) {
+                // Class byte
+                save = true;
+                checksum = true;
+            } else if (x == 3) {
+                // ID byte
+                checksum = true;
+                save = true;
+            } else if (x == 4) {
+                // First length byte (lower value byte)
+                msgLen = c;
+                checksum = true;
+                save = true;
+            } else if (x == 5) {
+                // Second length byte (higher value byte)
+                msgLen += ((uint16_t) c) << 8;
+                checksum = true;
+                save = true;
+            } else if ((x > 5) && (x < bufferLen) && (x < msgLen + GPS_UBX_PROTOCOL_HEADER_SIZE)) {
+                checksum = true;
+                save = true;
+            } else if (x == msgLen + GPS_UBX_PROTOCOL_HEADER_SIZE) {
+                // First checksum byte
+                save = true;
+                if (c == (uint8_t) ca) {
+                    checksumState++;
+                }
+            } else if (x == msgLen + GPS_UBX_PROTOCOL_HEADER_SIZE + 1) {
+                // Second checksum byte
+                save = true;
+                if (c == (uint8_t) cb) {
+                    checksumState++;
+                }
+            }
+            
+            if (checksum) {
+                ca += c;
+                cb += ca; 
+            }
+            
+            if (save) {
+                *(pBuffer + x) = c;
+                x++;
+            }
+            
+            if (!Serial1.available())
+            {
+                delay (GPS_INTER_CHARACTER_DELAY_MILLISECONDS);
+            }
+        }
+    } while ((checksumState != 2) && (millis() - t < waitMilliseconds));
+    
+    if (checksumState == 2) {
+        LOG_MSG("Read %d byte(s): ", x);
+        printHex(pBuffer, x);
+        LOG_MSG("\n");
+    } else {
+        x = 0;
+    }
+    
+    if (x >= bufferLen) {
+        LOG_MSG("WARNING: hit end of buffer (%d bytes).\n", x);
+    }
+    
+    return x;
+}
+
+/// Configure the GPS module.
+// NOTE: it is up to the caller to make
+// sure that the module is powered up
+static bool configureGps() {
+    bool success = true;
+
+    LOG_MSG("Configuring GPS...\n");
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 35.17 (CFG-RST)
+    LOG_MSG("Stopping GPS during configuration (CFG-RST)...\n");
+    msgBuffer[0] = 0x00;
+    msgBuffer[1] = 0x00; // Hot start
+    msgBuffer[2] = 0x08; // GNSS Stop
+    msgBuffer[3] = 0x00;
+    success = (sendUbx(0x06, 0x04, msgBuffer, 4, true) >= 0);
+
+    // See ublox7-V14_ReceiverDescrProtSpec section 35.9 (CFG-NAV5)
+    LOG_MSG("Setting automotive mode (CFG-NAV5)...\n");
+    memset (msgBuffer, 0, sizeof (msgBuffer));
+    msgBuffer[0] = 0x00; // Set dynamic config only
+    msgBuffer[1] = 0x01;
+    msgBuffer[2] = 0x04; // Automotive
+    success = (sendUbx(0x06, 0x24, msgBuffer, 36, true) >= 0);
+
+    // See ublox7-V14_ReceiverDescrProtSpec section 35.2 (CFG-CFG)
+    LOG_MSG("Storing settings in battery-backed RAM (CFG-CFG)...\n");
+    memset (msgBuffer, 0, sizeof (msgBuffer));
+     // Set all items in all bitmaps so that we clear, save and re-load
+    msgBuffer[0] = 0x00;
+    msgBuffer[1] = 0x00;
+    msgBuffer[2] = 0x06;
+    msgBuffer[3] = 0x1F;
+    msgBuffer[4] = 0x00;
+    msgBuffer[5] = 0x00;
+    msgBuffer[6] = 0x06;
+    msgBuffer[7] = 0x1F;
+    msgBuffer[8] = 0x00;
+    msgBuffer[9] = 0x00;
+    msgBuffer[10] = 0x06;
+    msgBuffer[11] = 0x1F;
+    msgBuffer[12] = 0x01;  // Save in BBR
+    success = (sendUbx(0x06, 0x09, msgBuffer, 13, true) >= 0);
+
+    // See ublox7-V14_ReceiverDescrProtSpec section 35.17 (CFG-RST)
+    LOG_MSG("Starting GPS again (CFG-RST)...\n");
+    memset (msgBuffer, 0, sizeof (msgBuffer));
+    msgBuffer[0] = 0x00;
+    msgBuffer[1] = 0x00; // Hot start
+    msgBuffer[2] = 0x09; // GNSS Start
+    msgBuffer[3] = 0x00;
+    success = (sendUbx(0x06, 0x04, msgBuffer, 4, true) >= 0);
+
+    return success;
+}
+
+/// Determine whether GPS has the necessary data to be
+// put into power save state.  This is to have downloaded
+// ephemeris data from sufficient satellites and to have
+// calibrated its RTC.
+static bool canGpsPowerSave() {
+    uint32_t powerSaveState = 0;
+    uint32_t numEntries = 0;
+    uint32_t numEphemerisData = 0;
+
+    LOG_MSG("Checking if GPS can power save...\n");
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 39.9 (NAV-SOL)
+    LOG_MSG("Checking fix (NAV-SOL)...\n");
+    if (sendUbx(0x01, 0x06, NULL, 0, false) >= 0) {
+        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+            // Have we got a 3D fix?
+            if (msgBuffer[10 + GPS_UBX_PROTOCOL_HEADER_SIZE] == 0x03) {
+                LOG_MSG("3D fix achieved.\n");
+                if (msgBuffer[11 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x01 == 0x01) {
+                    LOG_MSG("GPSfixOK flag is set.\n");
+                    powerSaveState++;
+                } else {
+                    LOG_MSG("GPSfixOK flag is NOT set (flags are 0x%02x).\n", msgBuffer[11 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
+                }
+            } else {
+                LOG_MSG("No 3D fix (fix is %d).\n", msgBuffer[10 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
+            }
+        } else {
+            LOG_MSG("No response.\n");
+        }
+    }
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 38.2 (MON-HW)
+    LOG_MSG("Checking if RTC is calibrated (MON-HW)...\n");
+    if (sendUbx(0x0A, 0x09, NULL, 0, false) >= 0) {
+        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+            if (msgBuffer[22 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x01 == 0x01) {
+                // If the rtcCalib bit is set, we're doing good...
+                powerSaveState++;
+                LOG_MSG("RTC is calibrated.\n");
+            } else {
+                LOG_MSG("RTC is NOT calibrated.\n");
+            }
+        } else {
+            LOG_MSG("No response.\n");
+        }
+    }
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 39.11 (NAV-SVINFO)
+    LOG_MSG("Checking ephemeris data (NAV-SVINFO)...\n");
+    if (sendUbx(0x01, 0x30, NULL, 0, false) >= 0) {
+        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+            // Check how many satellites we have ephemeris data for
+            numEntries = msgBuffer[4 + GPS_UBX_PROTOCOL_HEADER_SIZE];
+            LOG_MSG("  > %d entry/entries in the list", numEntries);
+            
+            if (numEntries > 0) {
+                LOG_MSG(": \n");
+                uint32_t i = GPS_UBX_PROTOCOL_HEADER_SIZE  + 8; // 8 is offset to start of satellites array
+                // Now need to check that enough are used for navigation
+                for (uint32_t x = 0; x < numEntries; x++) {
+                    // Print out the info
+                    LOG_MSG("  > chn %3d", msgBuffer[i]);
+                    LOG_MSG(", svid %3d", msgBuffer[i + 1]);
+                    LOG_MSG(", flags 0x%02x", msgBuffer[i + 2]);
+                    LOG_MSG(", quality 0x%02x", msgBuffer[i + 3]);
+                    LOG_MSG(", C/N (dBHz) %3d", msgBuffer[i + 4]);
+                    LOG_MSG(", elev %3d", msgBuffer[i + 5]);
+                    LOG_MSG(", azim %5d", ((uint16_t) msgBuffer[i + 6]) + ((uint16_t) (msgBuffer[i + 7] << 8)));
+                    LOG_MSG(", prRes %10d", ((uint32_t) msgBuffer[i + 8]) + ((uint32_t) (msgBuffer[i + 9] << 8)) +
+                            ((uint32_t) (msgBuffer[i + 10] << 16)) + ((uint32_t) (msgBuffer[i + 11] << 24)));
+                    if (msgBuffer[i + 2] & 0x01 == 0x01) { // 2 is offset to flags field in a satellite block
+                        numEphemerisData++;
+                        LOG_MSG(", used for navigation.\n");
+                    } else {
+                        LOG_MSG(", NOT usable.\n");
+                    }
+                    i += 12; // 12 is the size of a satellite block
+                }
+                LOG_MSG ("  > %d satellite(s) used for navigation with %d required.\n", numEphemerisData, GPS_MIN_NUM_EPHEMERIS_DATA);
+                if (numEphemerisData >= GPS_MIN_NUM_EPHEMERIS_DATA) {
+                    // Doing even better
+                    powerSaveState++;
+                }
+            } else {
+                LOG_MSG(".\n");
+            }
+        } else {
+            LOG_MSG("No response.\n");
+        }
+    }
+    
+    return (powerSaveState == 3);
+}
+
 /// Switch GPS on, returning the time that
 // GPS was switched on.
 static time_t gpsOn() {
-    if (digitalRead(D2)) {
-        // Log the time that GPS was swithed on
-        r.gpsPowerOnTime = Time.now();
-    }
-    digitalWrite(D2, LOW);
 
-    return Time.now();
+    if (digitalRead(D2)) {
+        // Log the time that GPS was switched on
+        r.gpsPowerOnTime = Time.now();
+        
+        digitalWrite(D2, LOW);
+        LOG_MSG("VCC applied to GPS...\n");
+        delay (GPS_POWER_ON_DELAY_MILLISECONDS);
+    }
+
+    return r.gpsPowerOnTime;
 }
 
 /// Switch GPS off.
-static void gpsOff() {
+static bool gpsOff() {
+    bool success = true;
+
     if (!digitalRead(D2)) {
         // Record the duration that GPS was on for
         updateTotalGpsSeconds();
+        
+        digitalWrite(D2, HIGH);
+        LOG_MSG("VCC removed from GPS...\n");
+        
+        if (!success) {
+            LOG_MSG("WARNING: couldn't send GPS 'off' commands to module before power-off.\n");
+        }
     }
-    digitalWrite(D2, HIGH);
+    
+    return success;
 }
 
 /// Update the GPS, making sure it's been on for
@@ -646,7 +1035,7 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
     uint32_t hdopValue;
     uint32_t age;
 
-    LOG("Checking for GPS fix for up to %d second(s):\n", GPS_FIX_TIME_SECONDS);
+    LOG_MSG("Checking for GPS fix for up to %d second(s):\n", GPS_FIX_TIME_SECONDS);
 
     // Make sure GPS is switched on
     gpsOn();
@@ -660,7 +1049,7 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
         while (!fixAchieved && Serial1.available()) {
             // parse GPS data
             char c = Serial1.read();
-            LOG("%c", c);
+            LOG_MSG("%c", c);
             if (gps.encode(c)) {
                 gps.f_get_position(&latitude, &longitude, &age);
                 if ((latitude != TinyGPS::GPS_INVALID_F_ANGLE) && (longitude != TinyGPS::GPS_INVALID_F_ANGLE)) {
@@ -687,28 +1076,54 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
         }
     }
     
-    LOG("\n");
-    if ((gps.satellites() != 255) && (gps.satellites() > 0)) {
-        LOG("%d satellites visible.\n", gps.satellites());
-    }
+    LOG_MSG("\n");
     if (fixAchieved){
-        LOG("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f, age: %.3f seconds",
+        LOG_MSG("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f, age: %.3f seconds",
             Time.now() - startTimeSeconds, latitude, longitude, ((float) age) / 1000);
         if (hdopValue != TinyGPS::GPS_INVALID_HDOP) {
-            LOG(", HDOP: %.2f.\n", ((float) hdopValue) / 100);
+            LOG_MSG(", HDOP: %.2f.\n", ((float) hdopValue) / 100);
         } else {
-            LOG(", no HDOP.\n");
+            LOG_MSG(", no HDOP.\n");
+        }
+        // See ublox7-V14_ReceiverDescrProtSpec section 41.3 (TIM-VRFY)
+        LOG_MSG("\nChecking RTC innaccuracy, for info, (TIM-VRFY)...");
+        if (sendUbx(0x0d, 0x06, NULL, 0, false) >= 0) {
+            if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+                uint8_t *pByte = &(msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE]);
+                LOG_MSG ("  > tow (ms): %d.%0d\n", ((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24), \
+                                                   ((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24));
+                LOG_MSG ("  > delta (ms): ");
+                bool negative = false;
+                int32_t iDelta = int32_t (((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24));
+                int32_t fDelta = int32_t (((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24));
+                if (iDelta < 0) {
+                    negative = true;
+                    iDelta = -iDelta;
+                }
+                if (fDelta < 0) {
+                    negative = true;
+                    fDelta = -fDelta;
+                }
+                if (negative) {
+                    LOG_MSG ("-");
+                }
+                LOG_MSG ("%d.%0d\n", iDelta, fDelta);
+                LOG_MSG ("  > week %d\n", ((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8));
+                LOG_MSG ("  > flags 0x%02x", *pByte);
+            } else {
+                LOG_MSG("No response.");
+            }
         }
     } else {
-        LOG("No fix this time.\n");
+        LOG_MSG("No fix this time.\n");
     }
     
     // Update the stats
     updateTotalGpsSeconds();
 
 #ifndef DISABLE_GPS_POWER_SAVING
-    // If GPS has achieved a fix, switch it off
-    if (fixAchieved) {
+    // If GPS has achieved a fix and met the power-save criteria, switch it off
+    if (canGpsPowerSave()) {
         gpsOff();
     }
 #endif
@@ -739,15 +1154,15 @@ static bool connect() {
         numConsecutiveConnectFailures = 0;
     } else {
         r.numConnectAttempts++;
-        LOG("Connecting to network (waiting for up to %d second(s))... ", WAIT_FOR_CONNECTION_SECONDS);
+        LOG_MSG("Connecting to network (waiting for up to %d second(s))... ", WAIT_FOR_CONNECTION_SECONDS);
         Particle.connect();
         if (waitFor(Particle.connected, WAIT_FOR_CONNECTION_SECONDS)) {
             success = true;
-            LOG("Connected.\n");
+            LOG_MSG("Connected.\n");
         } else {
             numConsecutiveConnectFailures++;
             r.numConnectFailed++;
-            LOG("WARNING: connection failed.\n");
+            LOG_MSG("WARNING: connection failed.\n");
         }
     }
     
@@ -759,7 +1174,7 @@ static bool establishTime() {
     bool success = false;
 
     if (Time.now() < MIN_TIME_UNIX_UTC) {
-        LOG("Syncing time (this will take %d second(s)).\n", TIME_SYNC_WAIT_SECONDS);
+        LOG_MSG("Syncing time (this will take %d second(s)).\n", TIME_SYNC_WAIT_SECONDS);
         connect();
         Particle.syncTime();
         // The above is an asynchronous call and so we've no alternative, if we want
@@ -775,7 +1190,7 @@ static bool establishTime() {
             setupCompleteSeconds = Time.now();
         }
     } else {
-        LOG("WARNING: unable to establish time (time now is %d).\n", Time.now());
+        LOG_MSG("WARNING: unable to establish time (time now is %d).\n", Time.now());
     }
 
     return success;
@@ -785,12 +1200,12 @@ static bool establishTime() {
 static char * getRecord(RecordType_t type) {
     char * pContents;
 
-    LOG("Using record %d.\n", currentRecord);
+    LOG_MSG("Using record %d.\n", currentRecord);
     
     ASSERT (currentRecord < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_1);
     
     if (records[currentRecord].isUsed) {
-        LOG("WARNING: records queue has wrapped, over-writing old data.\n");
+        LOG_MSG("WARNING: records queue has wrapped, over-writing old data.\n");
     } else {
         numRecordsQueued++;
     }
@@ -803,7 +1218,7 @@ static char * getRecord(RecordType_t type) {
     
     // Move the index on to the next record
     currentRecord = incModRecords(currentRecord);
-    LOG("Incremented currentRecord to %d.\n", currentRecord);
+    LOG_MSG("Incremented currentRecord to %d.\n", currentRecord);
     
     return pContents;
 }
@@ -834,7 +1249,7 @@ static void queueTelemetryReport() {
     char *pRecord;
     uint32_t contentsIndex = 0;
     
-   LOG("Queuing a telemetry report.\n");
+   LOG_MSG("Queuing a telemetry report.\n");
     
     // Start a new record
     pRecord = getRecord(RECORD_TYPE_TELEMETRY);
@@ -845,29 +1260,29 @@ static void queueTelemetryReport() {
     // Add battery status
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%.2f", fuel.getSoC());  // -1 for terminator
-        LOG("Battery level is %f.\n", fuel.getSoC());
+        LOG_MSG("Battery level is %f.\n", fuel.getSoC());
     } else {
-        LOG("WARNING: couldn't fit battery level into report.\n");
+        LOG_MSG("WARNING: couldn't fit battery level into report.\n");
     }
     
     // Add signal strength
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         CellularSignal signal = Cellular.RSSI();
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d", signal.rssi); // -1 for terminator
-        LOG("RSSI is %d.\n", signal.rssi);
+        LOG_MSG("RSSI is %d.\n", signal.rssi);
     } else {
-        LOG("WARNING: couldn't fit Signal Strength reading into report.\n");
+        LOG_MSG("WARNING: couldn't fit Signal Strength reading into report.\n");
     }
     
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) Time.now());  // -1 for terminator
-        LOG("Time now is %s UTC.\n", Time.timeStr().c_str());
+        LOG_MSG("Time now is %s UTC.\n", Time.timeStr().c_str());
     } else {
-        LOG("WARNING: couldn't fit timestamp into report.\n");
+        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
     
-    LOG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /// Queue a GPS report.
@@ -875,7 +1290,7 @@ static void queueGpsReport(float latitude, float longitude, bool motion, uint32_
     char *pRecord;
     uint32_t contentsIndex = 0;
 
-    LOG("Queuing a GPS report.\n");
+    LOG_MSG("Queuing a GPS report.\n");
     
     // Start a new record
     pRecord = getRecord(RECORD_TYPE_GPS);
@@ -887,22 +1302,22 @@ static void queueGpsReport(float latitude, float longitude, bool motion, uint32_
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%.6f;%.6f", latitude, longitude);  // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit GPS reading into report.\n");
+        LOG_MSG("WARNING: couldn't fit GPS reading into report.\n");
     }
         
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) timeOfFix);  // -1 for terminator
-        LOG("Time now is %s UTC.\n", Time.timeStr().c_str());
+        LOG_MSG("Time now is %s UTC.\n", Time.timeStr().c_str());
     } else {
-        LOG("WARNING: couldn't fit timestamp into report.\n");
+        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
     
     // Add motion to the end, to preserve backwards-compatibility
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%d", motion);  // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit motion indication into report.\n");
+        LOG_MSG("WARNING: couldn't fit motion indication into report.\n");
     }
         
     // Add HDOP to the end, to preserve backwards-compatibility
@@ -910,11 +1325,11 @@ static void queueGpsReport(float latitude, float longitude, bool motion, uint32_
         if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
             contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%.2f", ((float) hdop) / 100);  // -1 for terminator
         } else {
-            LOG("WARNING: couldn't fit HDOP into report.\n");
+            LOG_MSG("WARNING: couldn't fit HDOP into report.\n");
         }
     }
 
-    LOG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /// Queue a stats report.
@@ -927,7 +1342,7 @@ static void queueStatsReport() {
         upTimeSeconds = 1; // avoid div by 0
     }
 
-    LOG("Queuing a stats report.\n");
+    LOG_MSG("Queuing a stats report.\n");
     
     // Start a new record
     pRecord = getRecord(RECORD_TYPE_STATS);
@@ -943,7 +1358,7 @@ static void queueStatsReport() {
         }
     }
     if ((contentsIndex < 0) || (contentsIndex >= LEN_RECORD)) {
-        LOG("WARNING: couldn't fit fatal count and types into report.\n");
+        LOG_MSG("WARNING: couldn't fit fatal count and types into report.\n");
     }
     
     // Add up-time
@@ -951,21 +1366,21 @@ static void queueStatsReport() {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld.%ld:%02ld:%02ld",
                                    upTimeSeconds / 86400, (upTimeSeconds / 3600) % 24, (upTimeSeconds / 60) % 60,  upTimeSeconds % 60);  // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit up-time into report.\n");
+        LOG_MSG("WARNING: couldn't fit up-time into report.\n");
     }
     
     // Add %age power save time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%ld%%", r.totalPowerSaveSeconds * 100 / upTimeSeconds);  // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit percentage power saving time into report.\n");
+        LOG_MSG("WARNING: couldn't fit percentage power saving time into report.\n");
     }
     
     // Add %age GPS on time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";~%ld%%", r.totalGpsSeconds * 100 / upTimeSeconds);  // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit percentage GPS on time into report.\n");
+        LOG_MSG("WARNING: couldn't fit percentage GPS on time into report.\n");
     }
     
     // Add loop counts and position percentage
@@ -973,21 +1388,21 @@ static void queueStatsReport() {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";L%ldM%ldG%ldP%ld%%",
                                    r.numLoops, r.numLoopsMotionDetected, r.numLoopsGpsOn, (r.numLoopsLocationNeeded != 0) ? (r.numLoopsLocationValid * 100 / r.numLoopsLocationNeeded) : 0); // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit loop counts into report.\n");
+        LOG_MSG("WARNING: couldn't fit loop counts into report.\n");
     }
     
     // Add connect counts
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";C%ld-%ld", r.numConnectAttempts, r.numConnectFailed); // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit connect counts into report.\n");
+        LOG_MSG("WARNING: couldn't fit connect counts into report.\n");
     }
     
     // Add publish (== send) counts
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";S%ld-%ld", r.numPublishAttempts, r.numPublishFailed); // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit publish counts into report.\n");
+        LOG_MSG("WARNING: couldn't fit publish counts into report.\n");
     }
 
     // Add last accelerometer reading
@@ -995,7 +1410,7 @@ static void queueStatsReport() {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";X%dY%dZ%d",
                                    r.accelerometerReading.x, r.accelerometerReading.y, r.accelerometerReading.z); // -1 for terminator
     } else {
-        LOG("WARNING: couldn't fit last accelerometer reading into report.\n");
+        LOG_MSG("WARNING: couldn't fit last accelerometer reading into report.\n");
     }
     
     // Add Unix time
@@ -1003,10 +1418,10 @@ static void queueStatsReport() {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) Time.now());  // -1 for terminator
         Serial.printf("Time now is %s UTC.\n", Time.timeStr().c_str());
     } else {
-        LOG("WARNING: couldn't fit timestamp into report.\n");
+        LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
     
-    LOG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
 /// Send the queued reports, returning true if at least one
@@ -1024,23 +1439,23 @@ static bool sendQueuedReports() {
 
     // Publish any records that are marked as used
     x = nextPubRecord;
-    LOG("Sending report(s) (numRecordsQueued %d, nextPubRecord %d, currentRecord %d).\n", numRecordsQueued, x, currentRecord);
+    LOG_MSG("Sending report(s) (numRecordsQueued %d, nextPubRecord %d, currentRecord %d).\n", numRecordsQueued, x, currentRecord);
 
     do {
         ASSERT (x < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_3);
-        LOG("Report %d: ", x);
+        LOG_MSG("Report %d: ", x);
         if (records[x].isUsed) {
             // If this is a stats record and we're not reporting stats over the air
             // then just print this record and then mark it as unused
             if ((records[x].type == RECORD_TYPE_STATS) && !sendStatsReport) {
-                LOG("[Stats: %s]\n", records[x].contents);
+                LOG_MSG("[Stats: %s]\n", records[x].contents);
                 freeRecord(&(records[x]));
             } else {
                 // This is something we want to publish, so first connect
                 if (connect()) {
                     r.numPublishAttempts++;
                     if (Particle.publish(recordTypeString[records[x].type], records[x].contents, 60, PRIVATE)) {
-                        LOG("sent %s.\n", records[x].contents);
+                        LOG_MSG("sent %s.\n", records[x].contents);
                         // Keep track if we've sent a GPS report as, if we're in pre-operation mode,
                         // we can then go to sleep for longer.
                         if (records[x].type == RECORD_TYPE_GPS) {
@@ -1056,20 +1471,20 @@ static bool sendQueuedReports() {
                     } else {
                         r.numPublishFailed++;
                         failedCount++;
-                        LOG("WARNING: send failed.\n");
+                        LOG_MSG("WARNING: send failed.\n");
                     }
                 } else {
                     failedCount++;
-                    LOG("WARNING: send failed due to not being connected.\n");
+                    LOG_MSG("WARNING: send failed due to not being connected.\n");
                 }
             }
             // If there has not yet been a publish failure, increment the place to start next time
             if (failedCount == 0) {
                 nextPubRecord = incModRecords(nextPubRecord);
-                LOG("Incremented nextPubRecord to %d.\n", nextPubRecord);
+                LOG_MSG("Incremented nextPubRecord to %d.\n", nextPubRecord);
             }
         } else {
-            LOG("unused.\n");
+            LOG_MSG("unused.\n");
         }
 
         // Increment x
@@ -1077,7 +1492,7 @@ static bool sendQueuedReports() {
 
     } while (x != incModRecords(currentRecord));  // Loop until we've gone beyond the current record
 
-    LOG("%ld report(s) sent, %ld failed to send.\n", sentCount, failedCount);
+    LOG_MSG("%ld report(s) sent, %ld failed to send.\n", sentCount, failedCount);
     // If there's been a publish failure and nextPubRecord is
     // equal to currentRecord then we must have wrapped.  In this
     // case, increment nextPubRecord to keep things in time order.
@@ -1103,18 +1518,18 @@ static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
     }
     
     if (seconds > 0) {
-        LOG("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d second(s) in order to wake up at %s.\n",
-            Time.hour(), Time.minute(), Time.second(),
-            Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
-            Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
-            Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
-            seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+        LOG_MSG("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d second(s) in order to wake up at %s.\n",
+                Time.hour(), Time.minute(), Time.second(),
+                Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
+                Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
+                Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
+                seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
         // If we will still be in slow mode when we awake, no need to wake up until the first slow-operation
         // wake-up time
         if (Time.now() + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
             seconds += SLOW_MODE_INTERVAL_SECONDS;
-            LOG("Adding %d second(s) to this as we're in slow operation mode, so will actually wake up at %s.\n",
-                SLOW_MODE_INTERVAL_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+            LOG_MSG("Adding %d second(s) to this as we're in slow operation mode, so will actually wake up at %s.\n",
+                    SLOW_MODE_INTERVAL_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
         }
     
     } else {
@@ -1129,6 +1544,8 @@ static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
  ***************************************************************/
 
 void setup() {
+    bool gpsConfigured = false;
+    
     // Set up retained memory, if required
     if (strcmp (r.key, RETAINED_INITIALISED) != 0) {
         resetRetained();
@@ -1148,13 +1565,6 @@ void setup() {
     // Particle board) and switch it off
     pinMode(D7, OUTPUT);
     debugInd(DEBUG_IND_OFF);
-
-    // Set D2 to be an output (driving power to the GPS module)
-    // and set it to ON to allow GPS position to be established
-    // while we do everything else
-    pinMode(D2, OUTPUT);
-    digitalWrite (D2, HIGH);
-    gpsOn();
 
     // After a reset of the Electron board it takes a Windows PC several seconds
     // to sort out what's happened to its USB interface, hence you need this
@@ -1178,15 +1588,45 @@ void setup() {
 
     // Start the serial port for the GPS module
     Serial1.begin(9600);
+    Serial1.blockOnOverrun(true);
+    
+    // Set D2 to be an output (driving power to the GPS module)
+    pinMode(D2, OUTPUT);
+    LOG_MSG("VCC applied to GPS module.\n");
+
+    // Do the very initial configuration of GPS and then
+    // switch it off again.  This puts settings into battery
+    // backed RAM that can be restored later.
+    r.gpsPowerOnTime = Time.now();
+    digitalWrite(D2, LOW);
+    delay(GPS_POWER_ON_DELAY_MILLISECONDS);
+    gpsConfigured = configureGps();
+    if (!gpsConfigured) {
+        LOG_MSG("WARNING: couldn't configure GPS but continuing anyway.\n");
+    }
+    digitalWrite(D2, HIGH);
+    delay(GPS_POWER_ON_DELAY_MILLISECONDS);
+    
+    // Now properly power-up and configure GPS
+    gpsOn();
 
     // Set all the records used to false
     memset (records, false, sizeof (records));
 
     // Get the IMEI of the module
-    LOG("Getting IMEI...\n");
+    LOG_MSG("Getting IMEI...\n");
     Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
-    LOG("Started.\n");
+    LOG_MSG("Started.\n");
 
+    // Flash the LED to say that all is good
+#ifdef DISABLE_ACCELEROMETER
+    if (gpsConfigured) {
+#else
+    if (accelerometerConnected && gpsConfigured) {
+#endif
+        debugInd(DEBUG_IND_BOOT_COMPLETE);
+    }
+    
     // Setup is now complete
     setupCompleteSeconds = Time.now();
 }
@@ -1230,7 +1670,7 @@ void loop() {
 
             // IMEI retrieval can occasionally fail so check again here
             if (imei[0] < '0') {
-                LOG("WARNING: trying to get IMEI again...\n");
+                LOG_MSG("WARNING: trying to get IMEI again...\n");
                 Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
             }
 
@@ -1242,8 +1682,8 @@ void loop() {
 
                 // Is it time to do something?
                 if (Time.now() >= r.sleepTime + WAKEUP_PERIOD_SECONDS) {
-                    LOG("\nAwake: time now is %s UTC, slept since %s UTC (%d second(s) ago).\n",
-                        Time.timeStr().c_str(), Time.timeStr(r.sleepTime).c_str(), Time.now() - r.sleepTime);
+                    LOG_MSG("\nAwake: time now is %s UTC, slept since %s UTC (%d second(s) ago).\n",
+                            Time.timeStr().c_str(), Time.timeStr(r.sleepTime).c_str(), Time.now() - r.sleepTime);
 
                     // Set the default sleep time after we've done stuff
                     sleepForSeconds = WAKEUP_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
@@ -1252,7 +1692,7 @@ void loop() {
                     if (Time.now() - lastTelemetrySeconds >= TELEMETRY_PERIOD_SECONDS) {
                         lastTelemetrySeconds = Time.now();
                         queueTelemetryReport();
-                        LOG("Forcing a send.\n");
+                        LOG_MSG("Forcing a send.\n");
                         forceSend = true;
                     }
 
@@ -1264,16 +1704,16 @@ void loop() {
                         // If we've moved, or don't have a valid reading, take a new reading
                         if (!accelerometerConnected) {
                             getFix = true;
-                            LOG("No accelerometer, getting GPS reading every time.\n");
+                            LOG_MSG("No accelerometer, getting GPS reading every time.\n");
                         }
                         if (inMotion) {
                             getFix = true;
                             r.numLoopsMotionDetected++;
-                            LOG("*** Motion was detected, getting latest GPS reading.\n");
+                            LOG_MSG("*** Motion was detected, getting latest GPS reading.\n");
                         }
                         if (!gotInitialFix) {
                             getFix = true;
-                            LOG("No initial fix yet, trying again.\n");
+                            LOG_MSG("No initial fix yet, trying again.\n");
                         }
 
                         if (getFix) {
@@ -1292,7 +1732,7 @@ void loop() {
                                     lastGpsSeconds = Time.now();
                                     queueGpsReport(latitude, longitude, inMotion, hdop, Time.now() - (ageMilliseconds / 1000));
                                 } else {
-                                    LOG("GPS reading is too old (%.3f seconds with limit %d seconds).\n", ((float) ageMilliseconds) / 1000, GPS_PERIOD_SECONDS);
+                                    LOG_MSG("GPS reading is too old (%.3f seconds with limit %d seconds).\n", ((float) ageMilliseconds) / 1000, GPS_PERIOD_SECONDS);
                                 }
 #ifdef IGNORE_INVALID_GPS
                             } else {
@@ -1311,7 +1751,7 @@ void loop() {
                     // Check if it's time to publish the queued reports
                     if (forceSend || ((Time.now() - lastReportSeconds >= REPORT_PERIOD_SECONDS) && (numRecordsQueued >= QUEUE_SEND_LEN))) {
                         if (forceSend) {
-                            LOG("Force Send was set.\n");
+                            LOG_MSG("Force Send was set.\n");
                         }
                         forceSend = false;
 
@@ -1322,7 +1762,7 @@ void loop() {
                         // sleep to see if that recovers things
                         if (numConsecutiveConnectFailures > MAX_NUM_CONSECUTIVE_CONNECT_FAILURES) {
                             modemStaysAwake = false;
-                            LOG("Failed to connect %d times, power-cycling modem and resetting on next sleep.\n", numConsecutiveConnectFailures);
+                            LOG_MSG("Failed to connect %d times, power-cycling modem and resetting on next sleep.\n", numConsecutiveConnectFailures);
                         }
 
                         lastReportSeconds = Time.now(); // Do this at the end as transmission could, potentially, take some time
@@ -1371,9 +1811,9 @@ void loop() {
             }
 
             if (sleepForSeconds > 0) {
-                LOG("Awake too early (time now %s UTC, expected start time %s UTC), going back to sleep for %d second(s) in order to wake up at %s.\n",
-                    Time.timeStr().c_str(), Time.timeStr(START_TIME_UNIX_UTC).c_str(), sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
-                    Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+                LOG_MSG("Awake too early (time now %s UTC, expected start time %s UTC), going back to sleep for %d second(s) in order to wake up at %s.\n",
+                        Time.timeStr().c_str(), Time.timeStr(START_TIME_UNIX_UTC).c_str(), sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
+                        Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
             } else {
                 sleepForSeconds = 0;
             }
@@ -1391,13 +1831,13 @@ void loop() {
         modemStaysAwake = true;
     } // else condition of if() network time has been established
 
-    LOG("Loop %ld: now sleeping for %ld second(s) (will awake at %s UTC), modem will be ",
+    LOG_MSG("Loop %ld: now sleeping for %ld second(s) (will awake at %s UTC), modem will be ",
         r.numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
         Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
     if (modemStaysAwake) {
-        LOG("ON while sleeping.\n");
+        LOG_MSG("ON while sleeping.\n");
     } else {
-        LOG("OFF while sleeping.\n");
+        LOG_MSG("OFF while sleeping.\n");
     }
 
     // Make sure the debug LED is off to save power
