@@ -1,5 +1,4 @@
 #include "accelerometer.h"
-#include "TinyGPS.h"
 
 /* Tracker
  *
@@ -170,6 +169,9 @@
 /// Define this if using the USB port for debugging
 //#define USB_DEBUG
 
+/// Define this if a 2D GPS fix is sufficient
+#define GPS_FIX_2D
+
 /****************************************************************
  * CONFIGURATION MACROS
  ***************************************************************/
@@ -202,7 +204,14 @@
 // period.
 // NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS
 // when in USB_DEBUG mode.
-#define GPS_PERIOD_SECONDS 30
+#define GPS_PERIOD_SECONDS 20
+
+/// The time we wait for GPS to get a fix every GPS_PERIOD_SECONDS.
+#define GPS_FIX_TIME_SECONDS 20
+
+/// The interval at which we check for a fix, within
+// GPS_FIX_TIME_SECONDS
+#define GPS_CHECK_INTERVAL_SECONDS 5
 
 /// The minimum interval between wake-ups, to allow us to
 // sleep if the accelerometer is being triggered a lot
@@ -229,10 +238,6 @@
 
 /// The queue length at which to try sending a record.
 #define QUEUE_SEND_LEN 4
-
-/// The time allowed for GPS to sync each time, once
-// it has initially synchronised.
-#define GPS_FIX_TIME_SECONDS 10
 
 /// The minimum possible value of Time (in Unix, UTC), used
 // to check the sanity of our RTC time.
@@ -275,7 +280,11 @@
 #define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00 UTC, so 08:00 BST
 
 /// Duration of a working day in seconds.
+#ifdef DEV_BUILD
+# define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 16) // 16 hours, so day ends at 23:00 UTC (00:00 BST)
+#else
 # define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 10) // 10 hours, so day ends at 17:00 UTC (18:00 BST)
+#endif
 
 /// The accelerometer activity threshold (in units of 62.5 mg).
 // NOTE: this is extremely sensitive, likely to over-trigger.  A more relaxed value would be
@@ -302,6 +311,12 @@
 
 /// The minimum number of satellites for which we want to have ephemeris data
 #define GPS_MIN_NUM_EPHEMERIS_DATA 5
+
+/// Something to use as an invalid angle
+#define GPS_INVALID_ANGLE 999999999
+
+// Something to use as an invalid HDOP
+#define GPS_INVALID_HDOP 999999999
 
 /***************************************************************
  * OTHER MACROS
@@ -486,9 +501,6 @@ uint8_t msgBuffer[1024];
 static const char hexTable[] =
 { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
 
-/// Instantiate GPS.
-TinyGPS gps;
-
 /// Instantiate the accelerometer.
 Accelerometer accelerometer = Accelerometer();
 
@@ -519,6 +531,7 @@ STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
  * FUNCTION PROTOTYPES
  ***************************************************************/
 
+static uint32_t littleEndianUint32(uint8_t *pByte);
 static bool handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
 static int getImeiCallBack(int type, const char* pBuf, int len, char * pImei);
@@ -526,11 +539,12 @@ static void printHex(const char *pBytes, uint32_t lenBytes);
 int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck);
 static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds);
 static bool configureGps();
+static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
 static bool canGpsPowerSave();
 static void resetRetained();
 static time_t gpsOn();
 static bool gpsOff();
-static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude, uint32_t *pHdop, uint32_t *pAgeMilliseconds);
+static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
 static void updateTotalGpsSeconds();
 static bool connect();
 static bool establishTime();
@@ -538,7 +552,7 @@ static char * getRecord(RecordType_t type);
 static void freeRecord(Record_t *pRecord);
 static uint32_t incModRecords (uint32_t x);
 static void queueTelemetryReport();
-static void queueGpsReport(float latitude, float longitude, bool motion, uint32_t hdop, time_t timeOfFix);
+static void queueGpsReport(float latitude, float longitude, bool motion, float hdop);
 static void queueStatsReport();
 static bool sendQueuedReports();
 static uint32_t secondsToWorkingDayStart(uint32_t secondsToday);
@@ -546,6 +560,20 @@ static uint32_t secondsToWorkingDayStart(uint32_t secondsToday);
 /****************************************************************
  * STATIC FUNCTIONS
  ***************************************************************/
+
+/// Return a uint32_t from a pointer to a little-endian uint32_t
+// in memory
+static uint32_t littleEndianUint32(uint8_t *pByte) {
+    uint32_t retValue;
+    
+    retValue = *pByte;
+    retValue += ((uint32_t) *(pByte + 1)) << 8;
+    retValue += ((uint32_t) *(pByte + 2)) << 16;
+    retValue += ((uint32_t) *(pByte + 3)) << 24;
+    
+    return  retValue;
+}
+
 
 /// Reset the retained variables.
 static void resetRetained() {
@@ -843,14 +871,6 @@ static bool configureGps() {
 
     LOG_MSG("Configuring GPS...\n");
     
-    // See ublox7-V14_ReceiverDescrProtSpec section 35.17 (CFG-RST)
-    LOG_MSG("Stopping GPS during configuration (CFG-RST)...\n");
-    msgBuffer[0] = 0x00;
-    msgBuffer[1] = 0x00; // Hot start
-    msgBuffer[2] = 0x08; // GNSS Stop
-    msgBuffer[3] = 0x00;
-    success = (sendUbx(0x06, 0x04, msgBuffer, 4, true) >= 0);
-
     // See ublox7-V14_ReceiverDescrProtSpec section 35.9 (CFG-NAV5)
     LOG_MSG("Setting automotive mode (CFG-NAV5)...\n");
     memset (msgBuffer, 0, sizeof (msgBuffer));
@@ -878,22 +898,88 @@ static bool configureGps() {
     msgBuffer[12] = 0x01;  // Save in BBR
     success = (sendUbx(0x06, 0x09, msgBuffer, 13, true) >= 0);
 
-    // See ublox7-V14_ReceiverDescrProtSpec section 35.17 (CFG-RST)
-    LOG_MSG("Starting GPS again (CFG-RST)...\n");
-    memset (msgBuffer, 0, sizeof (msgBuffer));
-    msgBuffer[0] = 0x00;
-    msgBuffer[1] = 0x00; // Hot start
-    msgBuffer[2] = 0x09; // GNSS Start
-    msgBuffer[3] = 0x00;
-    success = (sendUbx(0x06, 0x04, msgBuffer, 4, true) >= 0);
-
     return success;
+}
+
+/// Return true if we have a GPS fix and fill in any given parameters (any of which may be NULL)
+static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop) {
+    bool gotFix = false;
+    float longitude;
+    float latitude;
+    float elevation = 0;
+    float hdop = GPS_INVALID_HDOP;
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 39.7 (NAV-PVT)
+    LOG_MSG("Checking fix (NAV-PVT)...\n");
+    if (sendUbx(0x01, 0x07, NULL, 0, false) >= 0) {
+        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+#ifdef GPS_FIX_2D
+            // Have we got at least a 2D fix?
+            if ((msgBuffer[20 + GPS_UBX_PROTOCOL_HEADER_SIZE] == 0x03) || (msgBuffer[20 + GPS_UBX_PROTOCOL_HEADER_SIZE] == 0x02)) {
+#else
+            // Have we got at least a 3D fix?
+            if (msgBuffer[20 + GPS_UBX_PROTOCOL_HEADER_SIZE] == 0x03) {
+#endif
+                LOG_MSG("%dD fix achieved.\n", msgBuffer[20 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
+                if ((msgBuffer[21 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x01) == 0x01) {
+                    LOG_MSG("gnssFixOK flag is set.\n");
+                    gotFix = true;
+                    longitude = ((float) (int32_t) littleEndianUint32(&(msgBuffer[24 + GPS_UBX_PROTOCOL_HEADER_SIZE]))) / 10000000;
+                    latitude = ((float) (int32_t) littleEndianUint32(&(msgBuffer[28 + GPS_UBX_PROTOCOL_HEADER_SIZE]))) / 10000000;
+                    elevation = ((float) (int32_t) littleEndianUint32(&(msgBuffer[36 + GPS_UBX_PROTOCOL_HEADER_SIZE]))) / 1000;
+                    LOG_MSG("  > %d satellites used.\n", msgBuffer[23 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
+                    LOG_MSG("  > Latitude %.6f.\n", latitude);
+                    LOG_MSG("  > Longitude %.6f.\n", longitude);
+                    if (msgBuffer[20 + GPS_UBX_PROTOCOL_HEADER_SIZE] == 0x03) {
+                        LOG_MSG("  > Elevation %.2f.\n", elevation);
+                    } else {
+                        LOG_MSG("  > Elevation ---.\n");
+                    }
+                    
+                    // Now get HDOP
+                    // See ublox7-V14_ReceiverDescrProtSpec section 39.4 (NAV-DOP)
+                    LOG_MSG("Getting HDOP (NAV-DOP)...\n");
+                    if (sendUbx(0x01, 0x04, NULL, 0, false) >= 0) {
+                        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+                            hdop = ((float) ((uint32_t) (msgBuffer[12 + GPS_UBX_PROTOCOL_HEADER_SIZE]) + ((uint32_t) (msgBuffer[13 + GPS_UBX_PROTOCOL_HEADER_SIZE]) << 8))) / 100;
+                            LOG_MSG("  > HDOP %.2f.\n", hdop);
+                        } else {
+                            LOG_MSG("No response.\n");
+                        }
+                    }
+
+                    if (pLatitude != NULL) {
+                        *pLatitude = latitude;
+                    }
+                    if (pLongitude != NULL) {
+                        *pLongitude = longitude;
+                    }
+                    if (pElevation != NULL) {
+                        *pElevation = elevation;
+                    }
+                    if (pHdop != NULL) {
+                        *pHdop = hdop;
+                    }
+                } else {
+                    LOG_MSG("gnssFixOK flag is NOT set (flags are 0x%02x).\n", msgBuffer[21 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
+                }
+            } else {
+                LOG_MSG("No fix (fix is %d).\n", msgBuffer[20 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
+            }
+        } else {
+            LOG_MSG("No response.\n");
+        }
+    }
+    
+    return gotFix;
 }
 
 /// Determine whether GPS has the necessary data to be
 // put into power save state.  This is to have downloaded
 // ephemeris data from sufficient satellites and to have
 // calibrated its RTC.
+// NOTE: it is up to the calleer to check separately if we
+// have the required accuracy of fix.
 static bool canGpsPowerSave() {
     uint32_t powerSaveState = 0;
     uint32_t numEntries = 0;
@@ -901,32 +987,11 @@ static bool canGpsPowerSave() {
 
     LOG_MSG("Checking if GPS can power save...\n");
     
-    // See ublox7-V14_ReceiverDescrProtSpec section 39.9 (NAV-SOL)
-    LOG_MSG("Checking fix (NAV-SOL)...\n");
-    if (sendUbx(0x01, 0x06, NULL, 0, false) >= 0) {
-        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
-            // Have we got a 3D fix?
-            if (msgBuffer[10 + GPS_UBX_PROTOCOL_HEADER_SIZE] == 0x03) {
-                LOG_MSG("3D fix achieved.\n");
-                if (msgBuffer[11 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x01 == 0x01) {
-                    LOG_MSG("GPSfixOK flag is set.\n");
-                    powerSaveState++;
-                } else {
-                    LOG_MSG("GPSfixOK flag is NOT set (flags are 0x%02x).\n", msgBuffer[11 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
-                }
-            } else {
-                LOG_MSG("No 3D fix (fix is %d).\n", msgBuffer[10 + GPS_UBX_PROTOCOL_HEADER_SIZE]);
-            }
-        } else {
-            LOG_MSG("No response.\n");
-        }
-    }
-    
     // See ublox7-V14_ReceiverDescrProtSpec section 38.2 (MON-HW)
     LOG_MSG("Checking if RTC is calibrated (MON-HW)...\n");
     if (sendUbx(0x0A, 0x09, NULL, 0, false) >= 0) {
         if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
-            if (msgBuffer[22 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x01 == 0x01) {
+            if ((msgBuffer[22 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x01) == 0x01) {
                 // If the rtcCalib bit is set, we're doing good...
                 powerSaveState++;
                 LOG_MSG("RTC is calibrated.\n");
@@ -959,9 +1024,8 @@ static bool canGpsPowerSave() {
                     LOG_MSG(", C/N (dBHz) %3d", msgBuffer[i + 4]);
                     LOG_MSG(", elev %3d", msgBuffer[i + 5]);
                     LOG_MSG(", azim %5d", ((uint16_t) msgBuffer[i + 6]) + ((uint16_t) (msgBuffer[i + 7] << 8)));
-                    LOG_MSG(", prRes %10d", ((uint32_t) msgBuffer[i + 8]) + ((uint32_t) (msgBuffer[i + 9] << 8)) +
-                            ((uint32_t) (msgBuffer[i + 10] << 16)) + ((uint32_t) (msgBuffer[i + 11] << 24)));
-                    if (msgBuffer[i + 2] & 0x01 == 0x01) { // 2 is offset to flags field in a satellite block
+                    LOG_MSG(", prRes %10d", littleEndianUint32 (&(msgBuffer[i + 8])));
+                    if ((msgBuffer[i + 2] & 0x01) == 0x01) { // 2 is offset to flags field in a satellite block
                         numEphemerisData++;
                         LOG_MSG(", used for navigation.\n");
                     } else {
@@ -982,7 +1046,13 @@ static bool canGpsPowerSave() {
         }
     }
     
-    return (powerSaveState == 3);
+    if (powerSaveState != 2) {
+        LOG_MSG("GPS NOT yet ready to power save.\n");
+    } else {
+        LOG_MSG("GPS can now power save.\n");
+    }
+    
+    return (powerSaveState == 2);
 }
 
 /// Switch GPS on, returning the time that
@@ -994,7 +1064,7 @@ static time_t gpsOn() {
         r.gpsPowerOnTime = Time.now();
         
         digitalWrite(D2, LOW);
-        LOG_MSG("VCC applied to GPS...\n");
+        LOG_MSG("VCC applied to GPS.\n");
         delay (GPS_POWER_ON_DELAY_MILLISECONDS);
     }
 
@@ -1010,7 +1080,7 @@ static bool gpsOff() {
         updateTotalGpsSeconds();
         
         digitalWrite(D2, HIGH);
-        LOG_MSG("VCC removed from GPS...\n");
+        LOG_MSG("VCC removed from GPS.\n");
         
         if (!success) {
             LOG_MSG("WARNING: couldn't send GPS 'off' commands to module before power-off.\n");
@@ -1023,17 +1093,13 @@ static bool gpsOff() {
 /// Update the GPS, making sure it's been on for
 // enough time to give us a fix. If onTimeSeconds
 // is non-zero then it represents the time at which GPS
-// was already switched on.  pLatitude, pLongitude, pHdop and
-// age in milliseconds are filled in with fix values and their
-// accuracy if a fix is achieved (and true is returned),
-// otherwise they are left alone.
-static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude, uint32_t *pHdop, uint32_t *pAgeMilliseconds) {
+// was already switched on.  pLatitude, pLongitude, pElevation,
+// pHdop and are filled in with fix values and their accuracy
+// if a fix is achieved (and true is returned), otherwise
+// they are left alone.
+static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude, float *pElevation, float *pHdop) {
     bool fixAchieved = false;
     uint32_t startTimeSeconds = Time.now();
-    float latitude;
-    float longitude;
-    uint32_t hdopValue;
-    uint32_t age;
 
     LOG_MSG("Checking for GPS fix for up to %d second(s):\n", GPS_FIX_TIME_SECONDS);
 
@@ -1045,43 +1111,25 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
     }
 
     while (!fixAchieved && (Time.now() - startTimeSeconds < GPS_FIX_TIME_SECONDS)) {
-        // Check GPS data is available
-        while (!fixAchieved && Serial1.available()) {
-            // parse GPS data
-            char c = Serial1.read();
-            LOG_MSG("%c", c);
-            if (gps.encode(c)) {
-                gps.f_get_position(&latitude, &longitude, &age);
-                if ((latitude != TinyGPS::GPS_INVALID_F_ANGLE) && (longitude != TinyGPS::GPS_INVALID_F_ANGLE)) {
-                    // Indicate that we have a fix
-                    debugInd (DEBUG_IND_GPS_FIX);
-
-                    fixAchieved = true;
-                    
-                    if (pLatitude) {
-                        *pLatitude = latitude;
-                    }
-                    if (pLongitude) {
-                        *pLongitude = longitude;
-                    }
-                    if (pAgeMilliseconds) {
-                        *pAgeMilliseconds = age;
-                    }
-                    hdopValue = gps.hdop();
-                    if (pHdop) {
-                        *pHdop = hdopValue;
-                    }
-                }
-            }
+        // Check for a fix
+        fixAchieved = gotGpsFix(pLatitude, pLongitude, pElevation, pHdop);
+        // Sleep while we're waiting
+        if (!fixAchieved) {
+#ifdef USB_DEBUG
+            // If we need the USB to be up there is no time to go to sleep
+            delay (GPS_CHECK_INTERVAL_SECONDS * 1000);
+#else
+            System.sleep(WKP, RISING, GPS_CHECK_INTERVAL_SECONDS, SLEEP_NETWORK_STANDBY);
+#endif
         }
     }
-    
+
     LOG_MSG("\n");
     if (fixAchieved){
-        LOG_MSG("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f, age: %.3f seconds",
-            Time.now() - startTimeSeconds, latitude, longitude, ((float) age) / 1000);
-        if (hdopValue != TinyGPS::GPS_INVALID_HDOP) {
-            LOG_MSG(", HDOP: %.2f.\n", ((float) hdopValue) / 100);
+        LOG_MSG("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f, elevation: %.3f m",
+                Time.now() - startTimeSeconds, *pLatitude, *pLongitude, *pElevation);
+        if (*pHdop != 0) {
+            LOG_MSG(", HDOP: %.2f.\n", *pHdop);
         } else {
             LOG_MSG(", no HDOP.\n");
         }
@@ -1089,13 +1137,12 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
         LOG_MSG("\nChecking RTC innaccuracy, for info, (TIM-VRFY)...");
         if (sendUbx(0x0d, 0x06, NULL, 0, false) >= 0) {
             if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
-                uint8_t *pByte = &(msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE]);
-                LOG_MSG ("  > tow (ms): %d.%0d\n", ((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24), \
-                                                   ((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24));
+                LOG_MSG ("  > tow (ms): %d.%0d\n", littleEndianUint32(&(msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE])), \
+                                                   littleEndianUint32(&(msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE + 4])));
                 LOG_MSG ("  > delta (ms): ");
                 bool negative = false;
-                int32_t iDelta = int32_t (((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24));
-                int32_t fDelta = int32_t (((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8) + (((uint32_t) *pByte++) << 16) + (((uint32_t) *pByte++) << 24));
+                int32_t iDelta = (int32_t) littleEndianUint32(&(msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE + 8]));
+                int32_t fDelta = (int32_t) littleEndianUint32(&(msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE + 12]));
                 if (iDelta < 0) {
                     negative = true;
                     iDelta = -iDelta;
@@ -1108,8 +1155,8 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
                     LOG_MSG ("-");
                 }
                 LOG_MSG ("%d.%0d\n", iDelta, fDelta);
-                LOG_MSG ("  > week %d\n", ((uint32_t) *pByte++) + (((uint32_t) *pByte++) << 8));
-                LOG_MSG ("  > flags 0x%02x", *pByte);
+                LOG_MSG ("  > week %d\n", (uint32_t) (msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE + 16]) + (((uint32_t) msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE + 17]) << 8));
+                LOG_MSG ("  > flags 0x%02x", msgBuffer[GPS_UBX_PROTOCOL_HEADER_SIZE + 18]);
             } else {
                 LOG_MSG("No response.");
             }
@@ -1123,7 +1170,7 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
 
 #ifndef DISABLE_GPS_POWER_SAVING
     // If GPS has achieved a fix and met the power-save criteria, switch it off
-    if (canGpsPowerSave()) {
+    if (canGpsPowerSave() && fixAchieved) {
         gpsOff();
     }
 #endif
@@ -1276,7 +1323,7 @@ static void queueTelemetryReport() {
     
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) Time.now());  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) Time.now());  // -1 for terminator
         LOG_MSG("Time now is %s UTC.\n", Time.timeStr().c_str());
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
@@ -1286,7 +1333,7 @@ static void queueTelemetryReport() {
 }
 
 /// Queue a GPS report.
-static void queueGpsReport(float latitude, float longitude, bool motion, uint32_t hdop, time_t timeOfFix) {
+static void queueGpsReport(float latitude, float longitude, bool motion, float hdop) {
     char *pRecord;
     uint32_t contentsIndex = 0;
 
@@ -1307,7 +1354,7 @@ static void queueGpsReport(float latitude, float longitude, bool motion, uint32_
         
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) timeOfFix);  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) Time.now());  // -1 for terminator
         LOG_MSG("Time now is %s UTC.\n", Time.timeStr().c_str());
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
@@ -1321,11 +1368,11 @@ static void queueGpsReport(float latitude, float longitude, bool motion, uint32_
     }
         
     // Add HDOP to the end, to preserve backwards-compatibility
-    if (hdop != TinyGPS::GPS_INVALID_HDOP) {
+    if (hdop != GPS_INVALID_HDOP) {
         if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-            contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%.2f", ((float) hdop) / 100);  // -1 for terminator
+            contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%.2f", hdop);  // -1 for terminator
         } else {
-            LOG_MSG("WARNING: couldn't fit HDOP into report.\n");
+            LOG_MSG("WARNING: couldn't fit PDOP into report.\n");
         }
     }
 
@@ -1415,7 +1462,7 @@ static void queueStatsReport() {
     
     // Add Unix time
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) (uint32_t) Time.now());  // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", (unsigned int) Time.now());  // -1 for terminator
         Serial.printf("Time now is %s UTC.\n", Time.timeStr().c_str());
     } else {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
@@ -1592,7 +1639,7 @@ void setup() {
     
     // Set D2 to be an output (driving power to the GPS module)
     pinMode(D2, OUTPUT);
-    LOG_MSG("VCC applied to GPS module.\n");
+    LOG_MSG("VCC applied to GPS module during setup.\n");
 
     // Do the very initial configuration of GPS and then
     // switch it off again.  This puts settings into battery
@@ -1605,6 +1652,7 @@ void setup() {
         LOG_MSG("WARNING: couldn't configure GPS but continuing anyway.\n");
     }
     digitalWrite(D2, HIGH);
+    LOG_MSG("VCC removed from GPS module at end of setup.\n");
     delay(GPS_POWER_ON_DELAY_MILLISECONDS);
     
     // Now properly power-up and configure GPS
@@ -1616,7 +1664,6 @@ void setup() {
     // Get the IMEI of the module
     LOG_MSG("Getting IMEI...\n");
     Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
-    LOG_MSG("Started.\n");
 
     // Flash the LED to say that all is good
 #ifdef DISABLE_ACCELEROMETER
@@ -1629,6 +1676,7 @@ void setup() {
     
     // Setup is now complete
     setupCompleteSeconds = Time.now();
+    LOG_MSG("Started.\n");
 }
 
 void loop() {
@@ -1637,10 +1685,10 @@ void loop() {
     bool modemStaysAwake = false;
     bool atLeastOneGpsReportSent = false;
     time_t gpsOnTime = 0;
-    float latitude = TinyGPS::GPS_INVALID_F_ANGLE;
-    float longitude = TinyGPS::GPS_INVALID_F_ANGLE;
-    uint32_t hdop = TinyGPS::GPS_INVALID_HDOP;
-    uint32_t ageMilliseconds = TinyGPS::GPS_INVALID_AGE;
+    float latitude = GPS_INVALID_ANGLE;
+    float longitude = GPS_INVALID_ANGLE;
+    float elevation = 0;
+    float hdop = GPS_INVALID_HDOP;
 
     // See if we've moved
     if (handleInterrupt()) {
@@ -1719,24 +1767,15 @@ void loop() {
                         if (getFix) {
                             r.numLoopsGpsOn++;
                             // Get the latest output from GPS
-                            if (gpsUpdate(gpsOnTime, &latitude, &longitude, &hdop, &ageMilliseconds)) {
+                            if (gpsUpdate(gpsOnTime, &latitude, &longitude, &elevation, &hdop)) {
                                 gotInitialFix = true;
                                 r.numLoopsGpsFix++;
-                                // Check that it's not too old
-#ifdef IGNORE_INVALID_GPS
-                                if (true) {
-#else
-                                if (ageMilliseconds < GPS_PERIOD_SECONDS * 1000) {
-#endif
-                                    r.numLoopsLocationValid++;
-                                    lastGpsSeconds = Time.now();
-                                    queueGpsReport(latitude, longitude, inMotion, hdop, Time.now() - (ageMilliseconds / 1000));
-                                } else {
-                                    LOG_MSG("GPS reading is too old (%.3f seconds with limit %d seconds).\n", ((float) ageMilliseconds) / 1000, GPS_PERIOD_SECONDS);
-                                }
+                                r.numLoopsLocationValid++;
+                                lastGpsSeconds = Time.now();
+                                queueGpsReport(latitude, longitude, inMotion, hdop);
 #ifdef IGNORE_INVALID_GPS
                             } else {
-                                queueGpsReport(latitude, longitude, inMotion, hdop, 0);
+                                queueGpsReport(latitude, longitude, inMotion, hdop);
 #endif
                             }
                         }
@@ -1755,7 +1794,7 @@ void loop() {
                         }
                         forceSend = false;
 
-                        atLeastOneGpsReportSent = sendQueuedReports();
+                        //atLeastOneGpsReportSent = sendQueuedReports();
                         
                         // Sending reports will have triggered connections.  If the number of connections
                         // is very bad, it might be a network or modem issue, so try putting everything to
