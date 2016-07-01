@@ -95,14 +95,15 @@
  * This is sent every GPS_PERIOD_SECONDS while moving, or at the wake-up time
  * in slow operation.
  * 
- * telemetry: 353816058851462;80.65;-70;1465283731
+ * telemetry: 353816058851462;80.65;-70;1465283731;1
  *
  * ...where the first item is the 15-digit IMEI, the second one
  * the battery left as a percentage, the third the signal strength
- * in dBm and the last one the timestamp in Unix time (UTC). All
- * fields must be present.  This is sent periodically when the device
- * wakes up from deep sleep and every TELEMETRY_PERIOD_SECONDS seconds
- * thereafter.
+ * in dBm and then the timestamp in Unix time (UTC).  After the timestamp,
+ * for backwards compatibility with earlier versions of this protocol,
+ * is the SW version. All fields except the SW version must be present.
+ * This is sent periodically when the device wakes up from deep sleep and
+ * every TELEMETRY_PERIOD_SECONDS seconds thereafter.
  *
  * NOTE: in addition to the above there is a "stats" message with
  * a similar format. This is used to send statistics purely as far
@@ -150,12 +151,16 @@
 
 /// Define this to force a development build, which sends
 // stats and initiates "working day" operation straight away
-#define DEV_BUILD
+//#define DEV_BUILD
 
 #ifdef DEV_BUILD
 /// Enable stats reporting.
 # define ENABLE_STATS_REPORTING
 #endif
+
+/// Defines this to extend the normal operating time of the SW
+// up to midnight
+//#define WORK_ALL_EVENING
 
 /// Define this to do GPS readings irrespective of the state of the
 // accelerometer.
@@ -175,6 +180,9 @@
 /****************************************************************
  * CONFIGURATION MACROS
  ***************************************************************/
+
+/// The version string of this software (an incrementing integer)
+#define SW_VERSION 1
 
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
@@ -280,7 +288,7 @@
 #define START_OF_WORKING_DAY_SECONDS (3600 * 7) // 07:00 UTC, so 08:00 BST
 
 /// Duration of a working day in seconds.
-#ifdef DEV_BUILD
+#ifdef WORK_ALL_EVENING
 # define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 16) // 16 hours, so day ends at 23:00 UTC (00:00 BST)
 #else
 # define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 10) // 10 hours, so day ends at 17:00 UTC (18:00 BST)
@@ -1329,6 +1337,14 @@ static void queueTelemetryReport() {
         LOG_MSG("WARNING: couldn't fit timestamp into report.\n");
     }
     
+    // Add software version
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", SW_VERSION);  // -1 for terminator
+        LOG_MSG("SW version is %s.\n", SW_VERSION);
+    } else {
+        LOG_MSG("WARNING: couldn't fit SW version into report.\n");
+    }
+    
     LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
 }
 
@@ -1794,7 +1810,7 @@ void loop() {
                         }
                         forceSend = false;
 
-                        //atLeastOneGpsReportSent = sendQueuedReports();
+                        atLeastOneGpsReportSent = sendQueuedReports();
                         
                         // Sending reports will have triggered connections.  If the number of connections
                         // is very bad, it might be a network or modem issue, so try putting everything to
