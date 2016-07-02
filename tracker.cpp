@@ -91,9 +91,8 @@
  * messaging system; these are a 1 if the reading was triggered due to the
  * accelerometer indicating motion (0 otherwise) and then the horizontal
  * dilution of position (i.e. accuracy) as a float.  All fields must be present
- * aside from the HDOP.
- * This is sent every GPS_PERIOD_SECONDS while moving, or at the wake-up time
- * in slow operation.
+ * aside from the HDOP. This is sent every GPS_PERIOD_SECONDS while moving,
+ * or at the wake-up time in slow operation.
  * 
  * telemetry: 353816058851462;80.65;-70;1465283731;1
  *
@@ -152,11 +151,6 @@
 /// Define this to force a development build, which sends
 // stats and initiates "working day" operation straight away
 //#define DEV_BUILD
-
-#ifdef DEV_BUILD
-/// Enable stats reporting.
-# define ENABLE_STATS_REPORTING
-#endif
 
 /// Defines this to extend the normal operating time of the SW
 // up to midnight
@@ -217,8 +211,7 @@
 /// The time we wait for GPS to get a fix every GPS_PERIOD_SECONDS.
 #define GPS_FIX_TIME_SECONDS 20
 
-/// The interval at which we check for a fix, within
-// GPS_FIX_TIME_SECONDS
+/// The interval at which we check for a fix, within GPS_FIX_TIME_SECONDS
 #define GPS_CHECK_INTERVAL_SECONDS 5
 
 /// The minimum interval between wake-ups, to allow us to
@@ -235,7 +228,11 @@
 #define TELEMETRY_PERIOD_SECONDS 600
 
 /// The periodicity of stats reports.
-#define STATS_PERIOD_SECONDS WAKEUP_PERIOD_SECONDS
+#ifdef DEV_BUILD
+# define STATS_PERIOD_SECONDS WAKEUP_PERIOD_SECONDS
+#else
+# define STATS_PERIOD_SECONDS TELEMETRY_PERIOD_SECONDS
+#endif
 
 /// The report period in seconds.  At this interval the
 // queued-up records are sent.
@@ -262,7 +259,7 @@
 #ifdef DEV_BUILD
 # define START_TIME_UNIX_UTC 1466586000 // 22 June 2016 @ 09:00 UTC
 #else
-# define START_TIME_UNIX_UTC 1467615600 // 4th July 2016 @ 07:00 UTC
+# define START_TIME_UNIX_UTC 1467529200 // 3th July 2016 @ 07:00 UTC
 #endif
 
 /// The number of times to wake-up during the working day when in slow operation.
@@ -479,6 +476,10 @@ time_t setupCompleteSeconds = 0;
 /// True if we've once achieved a fix
 bool gotInitialFix = false;
 
+/// The stats period, stored in RAM so that it can
+// be over-ridden
+time_t statsPeriodSeconds = STATS_PERIOD_SECONDS;
+
 /// The records accumulated.
 Record_t records[100];
 
@@ -494,6 +495,18 @@ uint32_t numRecordsQueued = 0;
 /// Track the number of consecutive connection
 // failures
 uint32_t numConsecutiveConnectFailures = 0;
+
+/// Track, for info, the number of satellites that
+// could be used for navigation, if there were any.
+uint32_t gpsNumSatellitesUsable = 0;
+
+/// Track, for info, the peak C/N of the satellites
+// used for navigation the last time there were any.
+uint32_t gpsPeakCNUsed = 0;
+
+/// Track, for info, the average C/N of the satellites
+// used for navigation the last time there were any.
+uint32_t gpsAverageCNUsed = 0;
 
 /// All the retained variables.
 retained Retained_t r;
@@ -581,7 +594,6 @@ static uint32_t littleEndianUint32(uint8_t *pByte) {
     
     return  retValue;
 }
-
 
 /// Reset the retained variables.
 static void resetRetained() {
@@ -992,6 +1004,8 @@ static bool canGpsPowerSave() {
     uint32_t powerSaveState = 0;
     uint32_t numEntries = 0;
     uint32_t numEphemerisData = 0;
+    uint32_t totalCN = 0;
+    uint32_t peakCN = 0;
 
     LOG_MSG("Checking if GPS can power save...\n");
     
@@ -1035,6 +1049,10 @@ static bool canGpsPowerSave() {
                     LOG_MSG(", prRes %10d", littleEndianUint32 (&(msgBuffer[i + 8])));
                     if ((msgBuffer[i + 2] & 0x01) == 0x01) { // 2 is offset to flags field in a satellite block
                         numEphemerisData++;
+                        totalCN += msgBuffer[i + 4];
+                        if (msgBuffer[i + 4] > peakCN) {
+                            peakCN = msgBuffer[i + 4];
+                        }
                         LOG_MSG(", used for navigation.\n");
                     } else {
                         LOG_MSG(", NOT usable.\n");
@@ -1052,6 +1070,13 @@ static bool canGpsPowerSave() {
         } else {
             LOG_MSG("No response.\n");
         }
+    }
+    
+    // Calculate the informational variables
+    if (numEphemerisData > 0) {
+        gpsNumSatellitesUsable = numEphemerisData;
+        gpsPeakCNUsed = peakCN;
+        gpsAverageCNUsed = totalCN / numEphemerisData;
     }
     
     if (powerSaveState != 2) {
@@ -1127,7 +1152,15 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
             // If we need the USB to be up there is no time to go to sleep
             delay (GPS_CHECK_INTERVAL_SECONDS * 1000);
 #else
+            // Otherwise, go to clock-stop sleep, keeping the modem up, and making sure that
+            // we don't wake-up early due to accelerometer activity
+            if (accelerometerConnected) {
+                accelerometer.disableInterrupts();
+            }
             System.sleep(WKP, RISING, GPS_CHECK_INTERVAL_SECONDS, SLEEP_NETWORK_STANDBY);
+            if (accelerometerConnected) {
+                accelerometer.enableInterrupts();
+            }
 #endif
         }
     }
@@ -1176,13 +1209,11 @@ static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude,
     // Update the stats
     updateTotalGpsSeconds();
 
-#ifndef DISABLE_GPS_POWER_SAVING
     // If GPS has achieved a fix and met the power-save criteria, switch it off
     if (canGpsPowerSave() && fixAchieved) {
         gpsOff();
     }
-#endif
-    
+
     return fixAchieved;
 }
 
@@ -1454,6 +1485,14 @@ static void queueStatsReport() {
         LOG_MSG("WARNING: couldn't fit loop counts into report.\n");
     }
     
+    // Add GPS background data
+    if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";N%ldCP%ldCA%ld",
+                                   gpsNumSatellitesUsable, gpsPeakCNUsed, gpsAverageCNUsed); // -1 for terminator
+    } else {
+        LOG_MSG("WARNING: couldn't fit GPS background data into report.\n");
+    }
+
     // Add connect counts
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";C%ld-%ld", r.numConnectAttempts, r.numConnectFailed); // -1 for terminator
@@ -1494,11 +1533,6 @@ static bool sendQueuedReports() {
     uint32_t sentCount = 0;
     uint32_t failedCount = 0;
     uint32_t x;
-    bool sendStatsReport = false;
-
-#ifdef ENABLE_STATS_REPORTING
-    sendStatsReport = true;
-#endif
 
     // Publish any records that are marked as used
     x = nextPubRecord;
@@ -1508,39 +1542,33 @@ static bool sendQueuedReports() {
         ASSERT (x < (sizeof (records) / sizeof (records[0])), FATAL_RECORDS_OVERRUN_3);
         LOG_MSG("Report %d: ", x);
         if (records[x].isUsed) {
-            // If this is a stats record and we're not reporting stats over the air
-            // then just print this record and then mark it as unused
-            if ((records[x].type == RECORD_TYPE_STATS) && !sendStatsReport) {
-                LOG_MSG("[Stats: %s]\n", records[x].contents);
-                freeRecord(&(records[x]));
-            } else {
-                // This is something we want to publish, so first connect
-                if (connect()) {
-                    r.numPublishAttempts++;
-                    if (Particle.publish(recordTypeString[records[x].type], records[x].contents, 60, PRIVATE)) {
-                        LOG_MSG("sent %s.\n", records[x].contents);
-                        // Keep track if we've sent a GPS report as, if we're in pre-operation mode,
-                        // we can then go to sleep for longer.
-                        if (records[x].type == RECORD_TYPE_GPS) {
-                            atLeastOneGpsReportSent = true;
-                        }
-                        freeRecord((&records[x]));
-                        sentCount++;
-                        // In the Particle code only four publish operations can be performed per second,
-                        // so put in a 1 second delay every four
-                        if (sentCount % 4 == 0) {
-                            delay (1000);
-                        }
-                    } else {
-                        r.numPublishFailed++;
-                        failedCount++;
-                        LOG_MSG("WARNING: send failed.\n");
+            // This is something we want to publish, so first connect
+            if (connect()) {
+                r.numPublishAttempts++;
+                if (Particle.publish(recordTypeString[records[x].type], records[x].contents, 60, PRIVATE)) {
+                    LOG_MSG("sent %s.\n", records[x].contents);
+                    // Keep track if we've sent a GPS report as, if we're in pre-operation mode,
+                    // we can then go to sleep for longer.
+                    if (records[x].type == RECORD_TYPE_GPS) {
+                        atLeastOneGpsReportSent = true;
+                    }
+                    freeRecord((&records[x]));
+                    sentCount++;
+                    // In the Particle code only four publish operations can be performed per second,
+                    // so put in a 1 second delay every four
+                    if (sentCount % 4 == 0) {
+                        delay (1000);
                     }
                 } else {
+                    r.numPublishFailed++;
                     failedCount++;
-                    LOG_MSG("WARNING: send failed due to not being connected.\n");
+                    LOG_MSG("WARNING: send failed.\n");
                 }
+            } else {
+                failedCount++;
+                LOG_MSG("WARNING: send failed due to not being connected.\n");
             }
+
             // If there has not yet been a publish failure, increment the place to start next time
             if (failedCount == 0) {
                 nextPubRecord = incModRecords(nextPubRecord);
@@ -1716,6 +1744,13 @@ void loop() {
     
     // Wait for USB to sort itself out
     delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
+    
+    // If we are in slow operation override the stats timer period
+    // so that it is more frequent; it is useful to see these stats in
+    // this "slow operation" case to check that the device is doing well.
+    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+        statsPeriodSeconds = WAKEUP_PERIOD_SECONDS;
+    }
 
     // Having valid time is fundamental to this program and so, if time
     // has not been established (via a connection to the Particle server),
@@ -1798,7 +1833,7 @@ void loop() {
                     }
                     
                     // Queue a stats report, if required
-                    if (Time.now() - lastStatsSeconds >= STATS_PERIOD_SECONDS) {
+                    if (Time.now() - lastStatsSeconds >= statsPeriodSeconds) {
                         lastStatsSeconds = Time.now();
                         queueStatsReport();
                     }
