@@ -81,7 +81,7 @@
  * The chosen message formats are hilghly compressed to
  * save data and are of the following form:
  *
- * gps: 353816058851462;51.283645;-0.776569;1465283731;1;5.15
+ * "gps":"353816058851462;51.283645;-0.776569;1465283731;1;5.15"
  *
  * ...where the first item is the 15-digit IMEI of the device, the
  * second one the latitude in degrees as a float, the third one the
@@ -90,11 +90,13 @@
  * to preserve backwards-compatibility with previous implementations of this
  * messaging system; these are a 1 if the reading was triggered due to the
  * accelerometer indicating motion (0 otherwise) and then the horizontal
- * dilution of position (i.e. accuracy) as a float.  All fields must be present
- * aside from the HDOP. This is sent every GPS_PERIOD_SECONDS while moving,
- * or at the wake-up time in slow operation.
+ * dilution of position (i.e. accuracy) as a float.  All fields up to and
+ * including the timestamp must be present; if either of the fields after the
+ * timestamp need to be included then both must be included. This message is
+ * sent every GPS_PERIOD_SECONDS while moving, or at the wake-up time in slow
+ * operation.
  * 
- * telemetry: 353816058851462;80.65;-70;1465283731;1
+ * "telemetry":"353816058851462;80.65;-70;1465283731;1"
  *
  * ...where the first item is the 15-digit IMEI, the second one
  * the battery left as a percentage, the third the signal strength
@@ -131,7 +133,7 @@
  * Lastly, if you connect to a site that reflects back what it
  * receives, you will see a hook-response something like:
  *
- * {"data":"{\"telemetry\":\"the stuff you actually sent","ttl":"60","published_at":"2016-06-08T09:27:10.130Z","coreid":"particle-internal","name":"hook-response/telemetry/0"}
+ * {"data":{"telemetry":"the stuff you actually sent","ttl":"60","published_at":"2016-06-08T09:27:10.130Z","coreid":"particle-internal","name":"hook-response/telemetry/0"}
  *
  * What the other end is actually _receiving_ is the value part
  * of the "data" key, so in this example:
@@ -241,7 +243,7 @@
 /// The size of a record.
 #define LEN_RECORD 120
 
-/// The queue length at which to try sending a record.
+/// The queue length at which to begin sending records.
 #define QUEUE_SEND_LEN 4
 
 /// The minimum possible value of Time (in Unix, UTC), used
@@ -249,7 +251,7 @@
 #define MIN_TIME_UNIX_UTC 1451606400 // 1 Jan 2016 @ midnight
 
 /// The maximum number of consecutive connection failures
-// before we take further action
+// before we take further action.
 #define MAX_NUM_CONSECUTIVE_CONNECT_FAILURES 5
 
 /// The start time for the device (in Unix, UTC).
@@ -292,35 +294,34 @@
 #endif
 
 /// The accelerometer activity threshold (in units of 62.5 mg).
-// NOTE: this is extremely sensitive, likely to over-trigger.  A more relaxed value would be
-// 10 or 16.
+// NOTE: this is extremely sensitive.  A more relaxed value would be 10 or 16.
 #define ACCELEROMETER_ACTIVITY_THRESHOLD 3
 
-/// GPS module power on delay
+/// GPS module power on delay.
 #define GPS_POWER_ON_DELAY_MILLISECONDS 500
 
-/// How long to wait for responses from the GPS module after sending commands
+/// How long to wait for responses from the GPS module after sending commands.
 #define GPS_DELAY_MILLISECONDS 100
 
-/// How long to wait for an Ack message back from the GPS module
+/// How long to wait for an Ack message back from the GPS module.
 #define GPS_WAIT_FOR_ACK_MILLISECONDS 3000
 
-/// How long to wait for non-ack responses from the GPS module
+/// How long to wait for non-ack responses from the GPS module.
 #define GPS_WAIT_FOR_RESPONSE_MILLISECONDS 2000
 
-/// Allow a gap between characters read from GPS when in command/response mode
+/// Allow a gap between characters read from GPS when in command/response mode.
 #define GPS_INTER_CHARACTER_DELAY_MILLISECONDS 50
 
-/// The offset at the start of a UBX protocol message
+/// The offset at the start of a UBX protocol message.
 #define GPS_UBX_PROTOCOL_HEADER_SIZE 6
 
-/// The minimum number of satellites for which we want to have ephemeris data
+/// The minimum number of satellites for which we want to have ephemeris data.
 #define GPS_MIN_NUM_EPHEMERIS_DATA 5
 
-/// Something to use as an invalid angle
+/// Something to use as an invalid angle.
 #define GPS_INVALID_ANGLE 999999999
 
-// Something to use as an invalid HDOP
+/// Something to use as an invalid HDOP.
 #define GPS_INVALID_HDOP 999999999
 
 /***************************************************************
@@ -388,7 +389,7 @@ typedef enum {
 // we can go to deep sleep and still keep a record of
 // what happened from initial power-on.  They are kept
 // in one structure so that they can all be reset with
-// a memset().
+// a single memset().
 typedef struct {
     // Something to use as a key so that we know whether 
     // retained memory has been initialised or not
@@ -458,26 +459,23 @@ bool accelerometerConnected = false;
 /// When we last tried to get a fix.
 time_t lastGpsSeconds = 0;
 
-/// Time Of the last ping message.
-time_t lastPingSeconds = 0;
-
 /// Time Of the last telemetry message.
 time_t lastTelemetrySeconds = 0;
 
 /// Time of the last stats report.
 time_t lastStatsSeconds = 0;
 
-/// Time Of the last report.
+/// Time when last sent queued reports.
 time_t lastReportSeconds = 0;
 
 /// The time at which setup was finished.
 time_t setupCompleteSeconds = 0;
 
-/// True if we've once achieved a fix
+/// True if we've once achieved a fix.
 bool gotInitialFix = false;
 
 /// The stats period, stored in RAM so that it can
-// be over-ridden
+// be overridden.
 time_t statsPeriodSeconds = STATS_PERIOD_SECONDS;
 
 /// The records accumulated.
@@ -493,7 +491,7 @@ uint32_t nextPubRecord = currentRecord;
 uint32_t numRecordsQueued = 0;
 
 /// Track the number of consecutive connection
-// failures
+// failures.
 uint32_t numConsecutiveConnectFailures = 0;
 
 /// Track, for info, the number of satellites that
@@ -511,14 +509,14 @@ uint32_t gpsAverageCNUsed = 0;
 /// All the retained variables.
 retained Retained_t r;
 
-/// Record if we're currently in motion.
+/// Set to true if we are currently in motion.
 bool inMotion = false;
 
 /// A general purpose buffer, used for sending
-// and receiving UBX commands to/from the GPS module
+// and receiving UBX commands to/from the GPS module.
 uint8_t msgBuffer[1024];
 
-/// For hex printing
+/// For hex printing.
 static const char hexTable[] =
 { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
 
@@ -583,7 +581,7 @@ static uint32_t secondsToWorkingDayStart(uint32_t secondsToday);
  ***************************************************************/
 
 /// Return a uint32_t from a pointer to a little-endian uint32_t
-// in memory
+// in memory.
 static uint32_t littleEndianUint32(uint8_t *pByte) {
     uint32_t retValue;
     
@@ -702,7 +700,7 @@ static void debugInd(DebugInd_t debugInd) {
     }
 }
 
-/// Print an array of bytes as hex
+/// Print an array of bytes as hex.
 static void printHex(const uint8_t *pBytes, uint32_t lenBytes)
 {
     char hexChar[2];
@@ -716,7 +714,7 @@ static void printHex(const uint8_t *pBytes, uint32_t lenBytes)
     }
 }
 
-/// Send a u-blox format message to the GPS module
+/// Send a u-blox format message to the GPS module.
 int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck)
 {
     uint8_t head[6] = {0xB5, 0x62, msgClass, msgId, (uint8_t) (msgLen >> 0), (uint8_t) (msgLen >> 8)};
@@ -794,7 +792,7 @@ int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msg
 
 /// Read a UBX format GPS message into a buffer.  If waitMilliseconds
 // is zero then don't hang around except for the intercharacter delay,
-// otherwise wait up to that number of milliseconds for the message
+// otherwise wait up to waitMilliseconds for the message.
 static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds) {
     uint32_t x = 0;
     uint16_t msgLen = 0;
@@ -884,8 +882,7 @@ static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitM
 }
 
 /// Configure the GPS module.
-// NOTE: it is up to the caller to make
-// sure that the module is powered up
+// NOTE: it is up to the caller to make sure that the module is powered up.
 static bool configureGps() {
     bool success = true;
 
@@ -921,7 +918,7 @@ static bool configureGps() {
     return success;
 }
 
-/// Return true if we have a GPS fix and fill in any given parameters (any of which may be NULL)
+/// Return true if we have a GPS fix and fill in any given parameters (any of which may be NULL).
 static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop) {
     bool gotFix = false;
     float longitude;
@@ -998,7 +995,7 @@ static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, fl
 // put into power save state.  This is to have downloaded
 // ephemeris data from sufficient satellites and to have
 // calibrated its RTC.
-// NOTE: it is up to the calleer to check separately if we
+// NOTE: it is up to the caller to check separately if we
 // have the required accuracy of fix.
 static bool canGpsPowerSave() {
     uint32_t powerSaveState = 0;
@@ -1088,8 +1085,7 @@ static bool canGpsPowerSave() {
     return (powerSaveState == 2);
 }
 
-/// Switch GPS on, returning the time that
-// GPS was switched on.
+/// Switch GPS on, returning the time that GPS was switched on.
 static time_t gpsOn() {
 
     if (digitalRead(D2)) {
@@ -1527,7 +1523,7 @@ static void queueStatsReport() {
 }
 
 /// Send the queued reports, returning true if at least one
-// GPS report was sent, otherwise false
+// GPS report was sent, otherwise false.
 static bool sendQueuedReports() {
     bool atLeastOneGpsReportSent = false;
     uint32_t sentCount = 0;
