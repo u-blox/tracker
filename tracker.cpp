@@ -21,7 +21,7 @@
  *   things you need to do for this to be safe, see the note
  *   in bom.xls.
  * - Processor sleep (sometimes with the modem on, sometimes
- *   with it off) is used to save* power between GPS fixes.
+ *   with it off) is used to save power between GPS fixes.
  *
  * In order to use power most efficiently, sleep is used in
  * combination with timed operation in the following way:
@@ -178,7 +178,7 @@
  ***************************************************************/
 
 /// The version string of this software (an incrementing integer)
-#define SW_VERSION 1
+#define SW_VERSION 2
 
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
@@ -270,7 +270,7 @@
 /// The maximum amount of time to wait for a GPS fix to be established while we are in
 // slow operation.  After this time, or as soon as a GPS fix has been established
 // and transmitted, we can go to deep sleep.
-#define SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS (60 * 5)
+#define SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS (60 * 10)
 
 /// The start time for full working day operation (in Unix, UTC).
 // After this time the device will be awake for the whole working day and send reports
@@ -562,6 +562,7 @@ static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, fl
 static bool canGpsPowerSave();
 static void resetRetained();
 static time_t gpsOn();
+static bool gpsIsOn();
 static bool gpsOff();
 static bool gpsUpdate(time_t onTimeSeconds, float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
 static void updateTotalGpsSeconds();
@@ -1100,6 +1101,11 @@ static time_t gpsOn() {
     return r.gpsPowerOnTime;
 }
 
+/// Return true if GPS is on, otherwise false
+static bool gpsIsOn() {
+    return !digitalRead(D2);
+}
+
 /// Switch GPS off.
 static bool gpsOff() {
     bool success = true;
@@ -1367,7 +1373,7 @@ static void queueTelemetryReport() {
     // Add software version
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
         contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";%u", SW_VERSION);  // -1 for terminator
-        LOG_MSG("SW version is %s.\n", SW_VERSION);
+        LOG_MSG("SW version is %u.\n", SW_VERSION);
     } else {
         LOG_MSG("WARNING: couldn't fit SW version into report.\n");
     }
@@ -1808,7 +1814,11 @@ void loop() {
                         }
                         if (!gotInitialFix) {
                             getFix = true;
-                            LOG_MSG("No initial fix yet, trying again.\n");
+                            LOG_MSG("No initial GPS fix yet.\n");
+                        }
+                        if (gpsIsOn()) {
+                            getFix = true;
+                            LOG_MSG("Still trying to get a GPS fix from last time.\n");
                         }
 
                         if (getFix) {
@@ -1921,9 +1931,14 @@ void loop() {
         r.numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
         Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
     if (modemStaysAwake) {
-        LOG_MSG("ON while sleeping.\n");
+        LOG_MSG("ON while sleeping");
     } else {
-        LOG_MSG("OFF while sleeping.\n");
+        LOG_MSG("OFF while sleeping");
+    }
+    if (gpsIsOn()) {
+        LOG_MSG(", GPS will be ON while sleeping.\n");
+    } else {
+        LOG_MSG(", GPS will be OFF while sleeping.\n");
     }
 
     // Make sure the debug LED is off to save power
