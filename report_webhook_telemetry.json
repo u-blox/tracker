@@ -1,6 +1,6 @@
 {
     "eventName": "telemetry",
-    "url": "https://cc2016api-staging.azurewebsites.net/api/geotracking/telemetry",
+    "url": "https://cc-webapi.azurewebsites.net/api/geotracking/telemetry",
     "requestType": "PUT",
     "headers": {"Authorization": "Basic OmJlMzcyNTNiLTFhZDYtNGUzMy1hNDA3LTVhNTMzNWZmOGZiMg=="},
     "json": {"telemetry": "{{PARTICLE_EVENT_VALUE}}"},
