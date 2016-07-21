@@ -149,11 +149,6 @@
 // accelerometer.
 //#define DISABLE_ACCELEROMETER
 
-/// Define this to record GPS values even if the values are not valid.
-// The invalid value is TinyGPS::GPS_INVALID_F_ANGLE, which comes
-// out as 1000 degrees.
-//#define IGNORE_INVALID_GPS
-
 /// Define this if using the USB port for debugging
 #define USB_DEBUG
 
@@ -190,20 +185,18 @@
 // NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS.
 #define TIME_SYNC_RETRY_PERIOD_SECONDS 30
 
-/// The minimum time between wake-ups during the working day.
+/// The time between wake-ups as a result of motion being detected.
 // NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS
 // when in USB_DEBUG mode.
-#define MIN_WAKEUP_PERIOD_SECONDS 30
-
-/// The maximum time between wake-ups during the working day.
-#define MAX_WAKEUP_PERIOD_SECONDS 3600
+#define MIN_MOTION_PERIOD_SECONDS 30
+#define MAX_MOTION_PERIOD_SECONDS 300
 
 /// The time for which we will keep the modem awake between
 // wake-ups
-#define MODEM_MAX_ON_TIME_SECONDS 300
+#define MODEM_MAX_ON_TIME_SECONDS 0
 
 /// The time we stay awake waiting for GPS to get a fix every
-// wakeupPeriodSeconds.
+// MOTION_PERIOD_SECONDS.
 // NOTE: the GPS device may stay awake for longer, this is only
 // the period for which the processing system running this
 // code stays awake waiting.
@@ -219,7 +212,7 @@
 #define MIN_SLEEP_PERIOD_SECONDS 6
 
 /// The periodicity of telemetry reports.
-#define TELEMETRY_PERIOD_SECONDS MAX_WAKEUP_PERIOD_SECONDS
+#define TELEMETRY_PERIOD_SECONDS (3600 * 8)
 
 /// The periodicity of stats reports.
 # define STATS_PERIOD_SECONDS TELEMETRY_PERIOD_SECONDS
@@ -385,23 +378,25 @@ typedef struct {
     // retained memory has been initialised or not
     char key[sizeof(RETAINED_INITIALISED)];
     // When we last tried to get a fix
-    time_t lastGpsSeconds = 0;
+    time_t lastGpsSeconds;
     // Time Of the last telemetry message
-    time_t lastTelemetrySeconds = 0;
+    time_t lastTelemetrySeconds;
     // Time of the last stats report
-    time_t lastStatsSeconds = 0;
+    time_t lastStatsSeconds;
     // Time when last sent queued reports
-    time_t lastReportSeconds = 0;
-    // The wake-up period
-    time_t wakeupPeriodSeconds = MIN_WAKEUP_PERIOD_SECONDS;
+    time_t lastReportSeconds;
+    // The time that motion was last detected
+    time_t lastMotionSeconds;
+    // Whether we've asked for a GPS fix or not
+    bool gpsFixRequested;
     // The records accumulated
     Record_t records[23];
     // The current record
-    uint32_t currentRecord = 0;
+    uint32_t currentRecord;
     // The next record to send
-    uint32_t nextPubRecord = currentRecord;
+    uint32_t nextPubRecord;
     // The number of records queued
-    uint32_t numRecordsQueued = 0;
+    uint32_t numRecordsQueued;
     // The number of times setup() has run in a working day
     uint32_t numSetupsCompletedToday;
     // The time we went to sleep
@@ -531,7 +526,7 @@ int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msg
 static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds);
 static bool configureGps();
 static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
-static bool gpsCanPowerSave(time_t sleepForSeconds);
+static bool gpsCanPowerSave();
 static void resetRetained();
 static time_t gpsOn();
 static bool gpsOff();
@@ -540,6 +535,8 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
 static void updateTotalGpsSeconds();
 static bool connect();
 static bool establishTime();
+static time_t getSleepTime(time_t lastTime, time_t period);
+static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pSleepForSeconds, time_t *pMinSleepPeriodSeconds);
 static char * getRecord(RecordType_t type);
 static void freeRecord(Record_t *pRecord);
 static uint32_t incModRecords (uint32_t x);
@@ -967,20 +964,17 @@ static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, fl
 /// Determine whether GPS has the necessary data to be
 // put into power save state.  This is to have downloaded
 // ephemeris data from sufficient satellites and to have
-// calibrated its RTC.  There is also a timeout check: if
-// the next time we will awake (in sleepForSeconds time)
-// is outside the GPS maximum on-time then give up and
-// allow power saving.
+// calibrated its RTC.  There is also a timeout check.
 // NOTE: it is up to the caller to check separately if we
 // have the required accuracy of fix.
-static bool gpsCanPowerSave(time_t sleepForSeconds) {
+static bool gpsCanPowerSave() {
     bool gpsCanPowerSave = false;
 
     LOG_MSG("Checking if GPS can power save...\n");
     
     if (gpsIsOn()) {
         LOG_MSG("GPS has been on for %d second(s).\n", Time.now() - r.gpsPowerOnTime);
-        if (Time.now() - r.gpsPowerOnTime + sleepForSeconds < GPS_MAX_ON_TIME_SECONDS) {
+        if (Time.now() - r.gpsPowerOnTime < GPS_MAX_ON_TIME_SECONDS) {
             uint32_t powerSaveState = 0;
             uint32_t numEntries = 0;
             uint32_t numEphemerisData = 0;
@@ -1066,7 +1060,7 @@ static bool gpsCanPowerSave(time_t sleepForSeconds) {
             }
         } else {
             gpsCanPowerSave = true;
-            LOG_MSG("GPS isn't ready but we'll be out of time when we wake up next in %d seconds so put it to sleep anyway.\n", sleepForSeconds);
+            LOG_MSG("GPS isn't ready but we're out of time so put it to sleep anyway.\n");
         }
     } else {
         gpsCanPowerSave = true;
@@ -1245,6 +1239,108 @@ static bool establishTime() {
     }
 
     return success;
+}
+
+/// Get the sleep time to the next event given the last time the event occurred and
+// it's periodicity
+static time_t getSleepTime(time_t lastTime, time_t period) {
+    time_t sleepDuration = period;
+    
+    if (lastTime > 0) {
+        sleepDuration = Time.now() + period - lastTime;
+    }
+    
+    return sleepDuration;
+}
+
+/// Sort out our timings after waking up to do something and return
+// whether the modem stays awake or not.
+static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pSleepForSeconds, time_t *pMinSleepPeriodSeconds) {
+    bool modemStaysAwake = true;
+    time_t minSleepPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
+    time_t sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
+
+    if (Time.now() >= START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+        // We're in full working day operation
+        // Begin by setting the sleep time to the longest possible time
+        sleepForSeconds = TELEMETRY_PERIOD_SECONDS;
+        
+        // Check if we're waiting for a GPS fix (after motion was triggered)
+        if (r.gpsFixRequested) {
+            // Sleep for the minimum period
+            sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
+            // If we've switched GPS off then we have finished with the fix
+            // and so return the request flag to false
+            if (!gpsIsOn()) {
+                r.gpsFixRequested = false;
+                // If we didn't achieve a fix then set the minimum sleep period
+                // to a larger value to avoid wasting power in places where there
+                // is motion but no GPS coverage
+                if (!fixAchieved) {
+                    minSleepPeriodSeconds = MAX_MOTION_PERIOD_SECONDS;
+                    sleepForSeconds = MAX_MOTION_PERIOD_SECONDS;
+                    
+                    // Queue a GPS report with dummy values to indicate that we tried and failed
+                    queueGpsReport(GPS_INVALID_ANGLE, GPS_INVALID_ANGLE, true, GPS_INVALID_HDOP);
+                }
+            }
+        }
+
+        // The other things that can wake us up are queueing telemetry reports, queuing stats reports
+        // and actually sending off the accumulated reports
+        sleepForSeconds = min(sleepForSeconds, getSleepTime (r.lastTelemetrySeconds, TELEMETRY_PERIOD_SECONDS));
+        sleepForSeconds = min(sleepForSeconds, getSleepTime (r.lastStatsSeconds, statsPeriodSeconds));
+        if (r.numRecordsQueued >= QUEUE_SEND_LEN) {
+            sleepForSeconds = min(sleepForSeconds, getSleepTime (r.lastReportSeconds, REPORT_PERIOD_SECONDS));
+        }
+        
+        // Make sure that the minSleepPeriodSeconds doesn't prevent us waking up for one of the above
+        if (sleepForSeconds < minSleepPeriodSeconds) {
+            minSleepPeriodSeconds = sleepForSeconds;
+        }
+
+#if MODEM_MAX_ON_TIME_SECONDS > 0        
+        // If the wake-up period is short enough, keep the modem awake to avoid
+        // frequent re-registrations, otherwise put it to sleep to save power
+        if (sleepForSeconds > MODEM_MAX_ON_TIME_SECONDS) {
+            modemStaysAwake = false;
+        }
+#endif
+
+        // Take into account the settling time
+        sleepForSeconds -= WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+        if (sleepForSeconds < 0) {
+            sleepForSeconds = 0;
+        }
+    } else {
+        // If we are still in slow operation and at least one GPS report has been sent, or we've
+        // timed out on getting a GPS fix during this slow operation wake-up, then we can go to
+        // deep sleep until the interval expires
+        if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
+            modemStaysAwake = false;
+            uint32_t numIntervalsPassed = (secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS) / SLOW_MODE_INTERVAL_SECONDS;
+            sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
+                              secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+            if (sleepForSeconds < 0) {
+                sleepForSeconds = 0;
+            }
+            // If we would be waking up after the end of the working day, have a proper sleep instead
+            if (secondsSinceMidnight + sleepForSeconds >
+                START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+                sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
+            }
+        }
+    }
+
+    // Set the variables passed in
+    if (pSleepForSeconds != NULL) {
+        *pSleepForSeconds = sleepForSeconds;
+    }
+    if (pMinSleepPeriodSeconds != NULL) {
+        *pMinSleepPeriodSeconds = minSleepPeriodSeconds;
+    }
+    
+    return modemStaysAwake;
 }
 
 /// Get a new record from the list.
@@ -1662,6 +1758,12 @@ void setup() {
     LOG_MSG("VCC removed from GPS module at end of setup.\n");
     delay(GPS_POWER_ON_DELAY_MILLISECONDS);
     
+    // If a GPS fix had already been requested then make sure
+    // that GPS is switched on
+    if (r.gpsFixRequested && !gpsIsOn()) {
+        gpsOn();
+    }
+    
     // Set all the records used to false
     memset (r.records, false, sizeof (r.records));
 
@@ -1684,12 +1786,14 @@ void setup() {
 }
 
 void loop() {
-    time_t sleepForSeconds = 0;
+    time_t sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
+    time_t minSleepPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
     bool forceSend = false;
     bool modemStaysAwake = false;
     bool wakeOnAccelerometer = false;
     bool atLeastOneGpsReportSent = false;
     bool inMotion = false;
+    bool fixAchieved = false;
     float latitude = GPS_INVALID_ANGLE;
     float longitude = GPS_INVALID_ANGLE;
     float elevation = 0;
@@ -1706,6 +1810,8 @@ void loop() {
     // See if we've moved
     inMotion = handleInterrupt();
     if (inMotion) {
+        r.gpsFixRequested = true;
+        r.lastMotionSeconds = Time.now();
         r.numLoopsMotionDetected++;
         LOG_MSG("*** Motion was detected.\n");
     }
@@ -1714,7 +1820,7 @@ void loop() {
     // so that it is more frequent; it is useful to see these stats in
     // this "slow operation" case to check that the device is doing well.
     if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
-        statsPeriodSeconds = r.wakeupPeriodSeconds;
+        statsPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
     }
 
     // Having valid time is fundamental to this program and so, if time
@@ -1747,28 +1853,8 @@ void loop() {
                 // During the working day we react to motion
                 wakeOnAccelerometer = true;
                     
-                // If we're not moving, increase the wakeup period for next time, otherwise
-                // keep it at the minimum
-                if (!inMotion) {
-                    r.wakeupPeriodSeconds *= 2;
-                    if (r.wakeupPeriodSeconds > MAX_WAKEUP_PERIOD_SECONDS) {
-                        r.wakeupPeriodSeconds = MAX_WAKEUP_PERIOD_SECONDS;
-                    }
-                } else {
-                    r.wakeupPeriodSeconds = MIN_WAKEUP_PERIOD_SECONDS;
-                }
-                
-                // If the wake-up period is short enough, keep the modem awake to avoid
-                // frequent re-registrations, otherwise put it to sleep to save power
-                if (r.wakeupPeriodSeconds < MODEM_MAX_ON_TIME_SECONDS) {
-                    modemStaysAwake = true;
-                }
-                
-                // Set the default sleep time for after we've done stuff
-                sleepForSeconds = r.wakeupPeriodSeconds - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-
                 // Queue a GPS report if we're in motion or can't tell if we're in motion
-                if (inMotion || !accelerometerConnected) {
+                if (r.gpsFixRequested || !accelerometerConnected) {
                     r.numLoopsLocationNeeded++;
                     
                     if (!accelerometerConnected) {
@@ -1780,20 +1866,17 @@ void loop() {
 
                     r.numLoopsGpsOn++;
                     // Get the latest output from GPS
-                    if (gpsUpdate(&latitude, &longitude, &elevation, &hdop)) {
+                    fixAchieved = gpsUpdate(&latitude, &longitude, &elevation, &hdop);
+                    if (fixAchieved) {
                         r.numLoopsGpsFix++;
                         r.numLoopsLocationValid++;
                         r.lastGpsSeconds = Time.now();
                         queueGpsReport(latitude, longitude, inMotion, hdop);
-#ifdef IGNORE_INVALID_GPS
-                    } else {
-                        queueGpsReport(latitude, longitude, inMotion, hdop);
-#endif
                     }
                 }
 
                 // If GPS meets the power-save criteria, switch it off
-                if (gpsIsOn() && gpsCanPowerSave(sleepForSeconds)) {
+                if (gpsIsOn() && gpsCanPowerSave()) {
                     gpsOff();
                 }
 
@@ -1816,40 +1899,21 @@ void loop() {
                     if (forceSend) {
                         LOG_MSG("Force Send was set.\n");
                     }
-                    forceSend = false;
 
                     atLeastOneGpsReportSent = sendQueuedReports();
                     
-                    // Sending reports will have triggered connections.  If the number of connections
-                    // is very bad, it might be a network or modem issue, so try putting everything to
-                    // sleep to see if that recovers things
-                    if (numConsecutiveConnectFailures > MAX_NUM_CONSECUTIVE_CONNECT_FAILURES) {
-                        modemStaysAwake = false;
-                        LOG_MSG("Failed to connect %d times, power-cycling modem and resetting on next sleep.\n", numConsecutiveConnectFailures);
-                    }
-
                     r.lastReportSeconds = Time.now(); // Do this at the end as transmission could, potentially, take some time
                 }
 
-                // If we are still in slow operation and at least one GPS report has been sent, or we've
-                // timed out on getting a GPS fix during this slow operation wake-up, then we can go to
-                // deep sleep until the interval expires
-                if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
-                    modemStaysAwake = true;
-                    if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
-                        modemStaysAwake = false;
-                        uint32_t numIntervalsPassed = (secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS) / SLOW_MODE_INTERVAL_SECONDS;
-                        sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
-                                          secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-                        if (sleepForSeconds < 0) {
-                            sleepForSeconds = 0;
-                        }
-                        // If we would be waking up after the end of the working day, have a proper sleep instead
-                        if (secondsSinceMidnight + sleepForSeconds >
-                            START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
-                            sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
-                        }
-                    }
+                // Sort out how long we can sleep for and whether the modem stays awake
+                modemStaysAwake = setTimings(secondsSinceMidnight, atLeastOneGpsReportSent, fixAchieved, &sleepForSeconds, &minSleepPeriodSeconds);
+                
+                // Sending reports will have triggered connections.  If the number of connection
+                // failures is high, it might be a network or modem issue, so try putting everything to
+                // sleep to see if that recovers things
+                if (numConsecutiveConnectFailures > MAX_NUM_CONSECUTIVE_CONNECT_FAILURES) {
+                    modemStaysAwake = false;
+                    LOG_MSG("Failed to connect %d times, power-cycling modem and resetting on next sleep.\n", numConsecutiveConnectFailures);
                 }
 
                 // Back to sleep now
@@ -1889,9 +1953,10 @@ void loop() {
     } // else condition of if() network time has been established
 
     // Print a load of informational stuff
-    LOG_MSG("Ending loop %ld: now sleeping for %ld second(s) (will awake at %s UTC), modem will be ",
-        r.numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
-        Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
+    LOG_MSG("Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d seconds.\n",
+             r.numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
+             Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str(), minSleepPeriodSeconds);
+    LOG_MSG("The modem will be ");
     if (modemStaysAwake) {
         LOG_MSG("ON");
     } else {
@@ -1933,8 +1998,6 @@ void loop() {
         // minimum.
         time_t sleepStartSeconds = Time.now();
         while (sleepForSeconds > 0) {
-            // Make sure sleepForSeconds never becomes 0 as that means "sleep forever"
-            // to the System.sleep() call
             if (modemStaysAwake) {
                 // Sleep with the network connection up so that we can send reports
                 // without having to re-register
@@ -1947,7 +2010,7 @@ void loop() {
             }
             // Adjust sleepForSeconds if we've woken up early due to motion
             if (Time.now() < sleepStartSeconds + sleepForSeconds) {
-                sleepForSeconds = MIN_WAKEUP_PERIOD_SECONDS - (Time.now() - sleepStartSeconds);
+                sleepForSeconds = minSleepPeriodSeconds - (Time.now() - sleepStartSeconds);
             } else {
                 sleepForSeconds = 0;
             }
