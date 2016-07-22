@@ -88,7 +88,7 @@ void Accelerometer::readDeviceRegisters(uint8_t address, uint32_t reg, uint8_t n
 // PUBLIC FUNCTIONS
 // ----------------------------------------------------------------
 
-/// Set up the accelerometer.
+/// Initial setup of the accelerometer
 bool Accelerometer::begin(void)
 {
     uint8_t bytesWritten;
@@ -98,6 +98,38 @@ bool Accelerometer::begin(void)
     // Start the I2C interface
     Wire.setSpeed(CLOCK_SPEED_100KHZ);
     Wire.begin();
+
+    // Setup the ADI XL345 accelerometer
+    // Reading register 0x00 should get us back 0xE5
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(0x00);
+    Wire.endTransmission();
+    if (bytesWritten == 1) {
+        if (Wire.requestFrom(ACCELEROMETER_ADDRESS, (uint8_t) 1) == 1) {
+            data[0] = Wire.read();
+            if (data[0] == 0xE5) {
+                success = true;
+                Serial.printf("Accelerometer is connected at I2C address 0x%02x.\n", ACCELEROMETER_ADDRESS);
+            } else {
+                Serial.printf("Accelerometer: I2C address 0x%02x, reading value of register 0x00 got 0x%02x but expected 0xE5.\n",
+                              ACCELEROMETER_ADDRESS, data[0]);
+            }
+        } else {
+            Serial.printf("Accelerometer: I2C address 0x%02x, timeout reading value of register 0x00.\n", ACCELEROMETER_ADDRESS);
+        }
+    } else {
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to write the address of register 0x00.\n", ACCELEROMETER_ADDRESS);
+    }
+
+    return success;
+}
+
+/// Configure the accelerometer.
+bool Accelerometer::configure(void)
+{
+    uint8_t bytesWritten;
+    bool success = false;
+    uint8_t data[2];
 
     // Setup the ADI XL345 accelerometer
     // Reading register 0x00 should get us back 0xE5

@@ -142,18 +142,21 @@
  ***************************************************************/
 
 /// Define this to force a development build, which sends
-// stats and initiates "working day" operation straight away
+// stats and initiates "working day" operation straight away.
 #define DEV_BUILD
 
 /// Define this to do GPS readings irrespective of the state of the
 // accelerometer.
 //#define DISABLE_ACCELEROMETER
 
-/// Define this if using the USB port for debugging
+/// Define this if using the USB port for debugging.
 #define USB_DEBUG
 
-/// Define this if a 2D GPS fix is sufficient
+/// Define this if a 2D GPS fix is sufficient.
 #define GPS_FIX_2D
+
+/// Define this to skip the actual sending.
+//#define SKIP_SEND
 
 /****************************************************************
  * CONFIGURATION MACROS
@@ -192,8 +195,8 @@
 #define MAX_MOTION_PERIOD_SECONDS 300
 
 /// The time for which we will keep the modem awake between
-// wake-ups
-#define MODEM_MAX_ON_TIME_SECONDS 0
+// wake-ups.  Set to zero to never switch the modem off.
+#define MODEM_MAX_ON_TIME_SECONDS 300
 
 /// The time we stay awake waiting for GPS to get a fix every
 // MOTION_PERIOD_SECONDS.
@@ -219,17 +222,13 @@
 
 /// The report period in seconds.  At this interval the
 // queued-up records are sent.
-#ifdef DEV_BUILD
-# define REPORT_PERIOD_SECONDS 120
-#else
-# define REPORT_PERIOD_SECONDS 300
-#endif
+# define REPORT_PERIOD_SECONDS 600
+
+/// The queue length at which to begin sending records.
+#define QUEUE_SEND_LEN 4
 
 /// The size of a record.
 #define LEN_RECORD 120
-
-/// The queue length at which to begin sending records.
-#define QUEUE_SEND_LEN 8
 
 /// The minimum possible value of Time (in Unix, UTC), used
 // to check the sanity of our RTC time.
@@ -273,6 +272,9 @@
 
 /// Duration of a working day in seconds.
 # define LENGTH_OF_WORKING_DAY_SECONDS (3600 * 24) // 24 hours
+
+/// Modem wake-up delay.
+#define MODEM_POWER_ON_DELAY_MILLISECONDS 1000
 
 /// The accelerometer activity threshold (in units of 62.5 mg).
 #define ACCELEROMETER_ACTIVITY_THRESHOLD 10
@@ -377,6 +379,14 @@ typedef struct {
     // Something to use as a key so that we know whether 
     // retained memory has been initialised or not
     char key[sizeof(RETAINED_INITIALISED)];
+    // Set this to true to indicate that we don't need to
+    // re-do the initialisation
+    bool warmStart;
+    // Shadow the state of GPS here so that we can replicate
+    // it on return from deep sleep
+    bool gpsOn;
+    // The IMEI of the module
+    char imei[IMEI_LENGTH];
     // When we last tried to get a fix
     time_t lastGpsSeconds;
     // Time Of the last telemetry message
@@ -399,9 +409,7 @@ typedef struct {
     uint32_t numRecordsQueued;
     // The number of times setup() has run in a working day
     uint32_t numSetupsCompletedToday;
-    // The time we went to sleep
-    time_t sleepTime;
-    // The time we actually went down to lost power state
+    // The time we went down to low power state
     time_t powerSaveTime;
     // Count the number of times around the loop, for info
     uint32_t numLoops;
@@ -421,6 +429,7 @@ typedef struct {
     uint32_t totalPowerSaveSeconds;
     // Count the number of seconds GPS has been on for
     time_t gpsPowerOnTime;
+    uint32_t gpsSeconds;
     uint32_t totalGpsSeconds;
     // Count the number of publish attempts
     uint32_t numPublishAttempts;
@@ -446,9 +455,6 @@ typedef struct {
 /// Record type strings.
 // NOTE: must match the RecordType_t enum above.
 const char * recordTypeString[] = {"null", "telemetry", "gps", "stats"};
-
-/// The IMEI of the module.
-char imei[IMEI_LENGTH] = "";
 
 /// Whether we have an accelerometer or not
 bool accelerometerConnected = false;
@@ -486,6 +492,12 @@ uint8_t msgBuffer[1024];
 /// For hex printing.
 static const char hexTable[] =
 { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f' };
+
+/// For date conversion.
+static const uint8_t daysInMonth[] = 
+{31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+static const uint8_t daysInMonthLeapYear[] = 
+{31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
 
 /// Instantiate the accelerometer.
 Accelerometer accelerometer = Accelerometer();
@@ -526,17 +538,19 @@ int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msg
 static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds);
 static bool configureGps();
 static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
+static bool gpsSetTime(time_t unixTimeUtc);
+static bool isLeapYear(uint32_t year);
+static bool gpsGetTime(time_t *pUnixTimeUtc);
 static bool gpsCanPowerSave();
 static void resetRetained();
 static time_t gpsOn();
 static bool gpsOff();
 static bool gpsIsOn();
 static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
-static void updateTotalGpsSeconds();
 static bool connect();
 static bool establishTime();
 static time_t getSleepTime(time_t lastTime, time_t period);
-static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pSleepForSeconds, time_t *pMinSleepPeriodSeconds);
+static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pMinSleepPeriodSeconds);
 static char * getRecord(RecordType_t type);
 static void freeRecord(Record_t *pRecord);
 static uint32_t incModRecords (uint32_t x);
@@ -565,6 +579,7 @@ static uint32_t littleEndianUint32(uint8_t *pByte) {
 
 /// Reset the retained variables.
 static void resetRetained() {
+    LOG_MSG("Resetting retained memory to defaults.\n");
     memset (&r, 0, sizeof (r));
     strcpy (r.key, RETAINED_INITIALISED);
     debugInd(DEBUG_IND_RETAINED_RESET);
@@ -961,6 +976,116 @@ static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, fl
     return gotFix;
 }
 
+/// Set the time on the GPS module
+// TODO: this doesn't seem to work correctly, needs investigation
+static bool gpsSetTime(time_t unixTimeUtc) {
+    bool success = false;
+    bool switchGpsOffAgain = !gpsIsOn();
+
+    // Make sure GPS is on
+    gpsOn();
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 34.8.2 (AID-INI)
+    LOG_MSG("Setting GPS time to %s (AID-INI)...\n", Time.timeStr().c_str());
+    memset (msgBuffer, 0, sizeof (msgBuffer));
+    msgBuffer[18] = Time.year(unixTimeUtc) - 2000;  // The year since 2000
+    msgBuffer[19] = Time.month(unixTimeUtc);
+    msgBuffer[20] = Time.day(unixTimeUtc);
+    msgBuffer[21] = Time.hour(unixTimeUtc);
+    msgBuffer[22] = Time.minute(unixTimeUtc);
+    msgBuffer[23] = Time.second(unixTimeUtc);
+    
+    msgBuffer[46] = 0x04;  // Time is in UTC
+    msgBuffer[47] = 0x02;  // Only time is being set
+
+    success = (sendUbx(0x0B, 0x01, msgBuffer, 48, false) >= 0);
+    
+    // Switch GPS off again if it was off to start with
+    if (switchGpsOffAgain) {
+        gpsOff();
+    }
+    
+    return success;
+}
+
+/// Check if a year is a leap year
+static bool isLeapYear(uint32_t year) {
+    bool leapYear = false;
+
+    if (year % 400 == 0) {
+        leapYear = true;
+    } else if (year % 4 == 0) {
+        leapYear = true;
+    }
+
+    return leapYear;
+}
+
+/// Read the time from the GPS module
+static bool gpsGetTime(time_t *pUnixTimeUtc) {
+    time_t gpsTime = 0;
+    bool success = false;
+    uint32_t months;
+    uint32_t year;
+    uint32_t x;
+    bool switchGpsOffAgain = !gpsIsOn();
+
+
+    // Make sure GPS is on
+    gpsOn();
+    
+    // See ublox7-V14_ReceiverDescrProtSpec section 39.13 (NAV-TIMEUTC)
+    LOG_MSG("Reading time from GPS (NAV-TIMEUTC)...\n");
+    if (sendUbx(0x01, 0x21, NULL, 0, false) >= 0) {
+        if (readGpsMsg(msgBuffer, sizeof(msgBuffer), GPS_WAIT_FOR_RESPONSE_MILLISECONDS) > 0) {
+            // Check the validity flag
+            if (msgBuffer[19 + GPS_UBX_PROTOCOL_HEADER_SIZE] & 0x04) {
+                // Year 1999-2099, so need to adjust to get year since 1970
+                year = ((uint32_t) (msgBuffer[12 + GPS_UBX_PROTOCOL_HEADER_SIZE])) + ((uint32_t) (msgBuffer[13 + GPS_UBX_PROTOCOL_HEADER_SIZE]) << 8) - 1999 + 29;
+                // Month (1 to 12), so take away 1 to make it zero-based
+                months = msgBuffer[14 + GPS_UBX_PROTOCOL_HEADER_SIZE] - 1;
+                months += year * 12;
+                // Work out the number of seconds due to the year/month count
+                for (x = 0; x < months; x++) {
+                    if (isLeapYear ((x / 12) + 1970)) {
+                        gpsTime += daysInMonthLeapYear[x % 12] * 3600 * 24;
+                    } else {
+                        gpsTime += daysInMonth[x % 12] * 3600 * 24;
+                    }
+                }
+                // Day (1 to 31)
+                gpsTime += ((uint32_t) msgBuffer[15 + GPS_UBX_PROTOCOL_HEADER_SIZE] - 1) * 3600 * 24;
+                // Hour (0 to 23)
+                gpsTime += ((uint32_t) msgBuffer[16 + GPS_UBX_PROTOCOL_HEADER_SIZE]) * 3600;
+                // Minute (0 to 59)
+                gpsTime += ((uint32_t) msgBuffer[17 + GPS_UBX_PROTOCOL_HEADER_SIZE]) * 60;
+                // Second (0 to 60)
+                gpsTime += msgBuffer[18 + GPS_UBX_PROTOCOL_HEADER_SIZE];
+                
+                LOG_MSG("GPS time is %s.\n", Time.timeStr(gpsTime).c_str());
+    
+                success = true;
+                if (pUnixTimeUtc != NULL) {
+                    *pUnixTimeUtc = gpsTime;
+                }
+            } else {
+                LOG_MSG("GPS time not valid.\n");
+            }
+        } else {
+            LOG_MSG("No response.\n");
+        }
+    } else {
+        LOG_MSG("Read request failed.\n");
+    }
+
+    // Switch GPS off again if it was off to start with
+    if (switchGpsOffAgain) {
+        gpsOff();
+    }
+    
+    return success;
+}
+
 /// Determine whether GPS has the necessary data to be
 // put into power save state.  This is to have downloaded
 // ephemeris data from sufficient satellites and to have
@@ -1060,7 +1185,7 @@ static bool gpsCanPowerSave() {
             }
         } else {
             gpsCanPowerSave = true;
-            LOG_MSG("GPS isn't ready but we're out of time so put it to sleep anyway.\n");
+            LOG_MSG("GPS isn't ready but we're out of time so put GPS to sleep anyway.\n");
         }
     } else {
         gpsCanPowerSave = true;
@@ -1078,6 +1203,7 @@ static time_t gpsOn() {
         r.gpsPowerOnTime = Time.now();
         
         digitalWrite(D2, LOW);
+        r.gpsOn = true;
         LOG_MSG("VCC applied to GPS.\n");
         delay (GPS_POWER_ON_DELAY_MILLISECONDS);
     }
@@ -1099,6 +1225,7 @@ static bool gpsOff() {
         }
     
         digitalWrite(D2, HIGH);
+        r.gpsOn = false;
         LOG_MSG("VCC removed from GPS.\n");
     }
     
@@ -1217,19 +1344,25 @@ static bool connect() {
 /// Make sure we have time sync.
 static bool establishTime() {
     bool success = false;
+    time_t gpsTime = 0;
 
-    if (Time.now() < MIN_TIME_UNIX_UTC) {
-        LOG_MSG("Time.now() reported as %s UTC, so syncing time (this will take %d second(s)).\n", Time.timeStr().c_str(), TIME_SYNC_WAIT_SECONDS);
-        connect();
-        Particle.syncTime();
-        // The above is an asynchronous call and so we've no alternative, if we want
-        // to be sure that time is correct, then to hang around for a bit and see
-        delay(TIME_SYNC_WAIT_SECONDS * 1000);
+    if (Time.now() <= MIN_TIME_UNIX_UTC) {
+        if (gpsGetTime(&gpsTime) && (gpsTime > MIN_TIME_UNIX_UTC)) {
+            LOG_MSG("Time.now() reported as %s UTC, using GPS time instead...\n", Time.timeStr(gpsTime).c_str());
+            Time.setTime(gpsTime);
+        } else {
+            LOG_MSG("Time.now() reported as %s UTC and no GPS time, syncing time with network (this will take %d second(s)).\n", Time.timeStr().c_str(), TIME_SYNC_WAIT_SECONDS);
+            connect();
+            Particle.syncTime();
+            // The above is an asynchronous call and so we've no alternative, if we want
+            // to be sure that time is correct, then to hang around for a bit and see
+            delay(TIME_SYNC_WAIT_SECONDS * 1000);
+        }
     }
     
-    if (Time.now() >= MIN_TIME_UNIX_UTC) {
+    if (Time.now() > MIN_TIME_UNIX_UTC) {
         success = true;
-        if (setupCompleteSeconds < MIN_TIME_UNIX_UTC) {
+        if (setupCompleteSeconds <= MIN_TIME_UNIX_UTC) {
             // If we didn't already have time established when we left setup(),
             // reset it to a more correct time here.
             setupCompleteSeconds = Time.now();
@@ -1247,16 +1380,18 @@ static time_t getSleepTime(time_t lastTime, time_t period) {
     time_t sleepDuration = period;
     
     if (lastTime > 0) {
-        sleepDuration = Time.now() + period - lastTime;
+        sleepDuration = period - (Time.now() - lastTime);
+        if (sleepDuration < 0) {
+            sleepDuration = 0;
+        }
     }
     
     return sleepDuration;
 }
 
-/// Sort out our timings after waking up to do something and return
-// whether the modem stays awake or not.
-static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pSleepForSeconds, time_t *pMinSleepPeriodSeconds) {
-    bool modemStaysAwake = true;
+/// Sort out our timings after waking up to do something
+static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pMinSleepPeriodSeconds) {
+    time_t x;
     time_t minSleepPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
     time_t sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
 
@@ -1264,48 +1399,62 @@ static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSe
         // We're in full working day operation
         // Begin by setting the sleep time to the longest possible time
         sleepForSeconds = TELEMETRY_PERIOD_SECONDS;
+        LOG_MSG("Next wake-up set to %d second(s).\n", sleepForSeconds);
         
-        // Check if we're waiting for a GPS fix (after motion was triggered)
-        if (r.gpsFixRequested) {
+        // Check if we're doing a GPS fix (after motion was triggered)
+        if (gpsIsOn()) {
             // Sleep for the minimum period
             sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
-            // If we've switched GPS off then we have finished with the fix
-            // and so return the request flag to false
-            if (!gpsIsOn()) {
-                r.gpsFixRequested = false;
-                // If we didn't achieve a fix then set the minimum sleep period
-                // to a larger value to avoid wasting power in places where there
-                // is motion but no GPS coverage
-                if (!fixAchieved) {
-                    minSleepPeriodSeconds = MAX_MOTION_PERIOD_SECONDS;
-                    sleepForSeconds = MAX_MOTION_PERIOD_SECONDS;
-                    
-                    // Queue a GPS report with dummy values to indicate that we tried and failed
-                    queueGpsReport(GPS_INVALID_ANGLE, GPS_INVALID_ANGLE, true, GPS_INVALID_HDOP);
-                }
+            LOG_MSG("Still looking for a GPS fix so wake-up again in %d second(s).\n", sleepForSeconds);
+        } else {
+            // If we didn't achieve a fix then set the minimum sleep period
+            // to a larger value to avoid wasting power in places where there
+            // is motion but no GPS coverage
+            if (r.gpsFixRequested && !fixAchieved) {
+                LOG_MSG("GPS fix failure, setting min sleep period to %d second(s).\n", MAX_MOTION_PERIOD_SECONDS);
+                minSleepPeriodSeconds = MAX_MOTION_PERIOD_SECONDS;
+                // Queue a GPS report with dummy values to indicate that we tried and failed
+                queueGpsReport(GPS_INVALID_ANGLE, GPS_INVALID_ANGLE, true, GPS_INVALID_HDOP);
             }
+            // Reset the fix request flag
+            r.gpsFixRequested = false;
         }
 
-        // The other things that can wake us up are queueing telemetry reports, queuing stats reports
+        // The things that can wake us up are queueing telemetry reports, queuing stats reports
         // and actually sending off the accumulated reports
-        sleepForSeconds = min(sleepForSeconds, getSleepTime (r.lastTelemetrySeconds, TELEMETRY_PERIOD_SECONDS));
-        sleepForSeconds = min(sleepForSeconds, getSleepTime (r.lastStatsSeconds, statsPeriodSeconds));
-        if (r.numRecordsQueued >= QUEUE_SEND_LEN) {
-            sleepForSeconds = min(sleepForSeconds, getSleepTime (r.lastReportSeconds, REPORT_PERIOD_SECONDS));
+        x = getSleepTime (r.lastTelemetrySeconds, TELEMETRY_PERIOD_SECONDS);
+        LOG_MSG("Next wake-up to record telemetry is in %d second(s) (last was at %s UTC).\n",
+                 x, Time.timeStr(r.lastTelemetrySeconds).c_str());
+        if (x < sleepForSeconds) {
+            sleepForSeconds = x;
+            LOG_MSG("Next wake-up set to %d second(s).\n", x);
+        }
+        x = getSleepTime (r.lastStatsSeconds, statsPeriodSeconds);
+        LOG_MSG("Next wake-up to record stats is in %d second(s) (last was at %s UTC).\n",
+                x, Time.timeStr(r.lastStatsSeconds).c_str());
+        if (x < sleepForSeconds) {
+            sleepForSeconds = x;
+            LOG_MSG("Next wake-up set to %d second(s).\n", x);
+        }
+        if (r.numRecordsQueued > 0) {
+            x = getSleepTime (r.lastReportSeconds, REPORT_PERIOD_SECONDS);
+            LOG_MSG("Next wake-up to send the %d queued report(s) is in %d second(s) (last was at %s UTC).\n",
+                    r.numRecordsQueued, x, Time.timeStr(r.lastReportSeconds).c_str());
+            if (x < sleepForSeconds) {
+                sleepForSeconds = x;
+                LOG_MSG("Next wake-up set to %d second(s).\n", x);
+            }
+        } else {
+            LOG_MSG("No records queued so not waking-up to send them.\n");
         }
         
         // Make sure that the minSleepPeriodSeconds doesn't prevent us waking up for one of the above
         if (sleepForSeconds < minSleepPeriodSeconds) {
+            LOG_MSG("Min sleep time, %d, is less than the sleep time we want, setting min sleep time to %d second(s).\n", minSleepPeriodSeconds, sleepForSeconds);
             minSleepPeriodSeconds = sleepForSeconds;
         }
 
-#if MODEM_MAX_ON_TIME_SECONDS > 0        
-        // If the wake-up period is short enough, keep the modem awake to avoid
-        // frequent re-registrations, otherwise put it to sleep to save power
-        if (sleepForSeconds > MODEM_MAX_ON_TIME_SECONDS) {
-            modemStaysAwake = false;
-        }
-#endif
+        LOG_MSG("Sleep time set to %d second(s).\n", sleepForSeconds);
 
         // Take into account the settling time
         sleepForSeconds -= WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
@@ -1313,11 +1462,9 @@ static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSe
             sleepForSeconds = 0;
         }
     } else {
-        // If we are still in slow operation and at least one GPS report has been sent, or we've
-        // timed out on getting a GPS fix during this slow operation wake-up, then we can go to
-        // deep sleep until the interval expires
+        // But, if at least one GPS report has been sent, or we've ended this slow
+        // operation wake-up, then we can go to deep sleep until the interval expires
         if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
-            modemStaysAwake = false;
             uint32_t numIntervalsPassed = (secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS) / SLOW_MODE_INTERVAL_SECONDS;
             sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
                               secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
@@ -1332,15 +1479,12 @@ static bool setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSe
         }
     }
 
-    // Set the variables passed in
-    if (pSleepForSeconds != NULL) {
-        *pSleepForSeconds = sleepForSeconds;
-    }
+    // Set the variable passed in
     if (pMinSleepPeriodSeconds != NULL) {
         *pMinSleepPeriodSeconds = minSleepPeriodSeconds;
     }
     
-    return modemStaysAwake;
+    return sleepForSeconds;
 }
 
 /// Get a new record from the list.
@@ -1372,7 +1516,7 @@ static char * getRecord(RecordType_t type) {
 
 /// Free a record.
 static void freeRecord(Record_t *pRecord) {
-    if (pRecord) {
+    if (pRecord != NULL) {
         pRecord->isUsed = false;
         if (r.numRecordsQueued > 0) {
             r.numRecordsQueued--;
@@ -1402,7 +1546,7 @@ static void queueTelemetryReport() {
     pRecord = getRecord(RECORD_TYPE_TELEMETRY);
 
     // Add the device ID
-    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, imei);  // -1 for terminator
+    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, r.imei);  // -1 for terminator
 
     // Add battery status
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
@@ -1451,7 +1595,7 @@ static void queueGpsReport(float latitude, float longitude, bool motion, float h
     pRecord = getRecord(RECORD_TYPE_GPS);
 
     // Add the device ID
-    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, imei);  // -1 for terminator
+    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, r.imei);  // -1 for terminator
 
     // Add GPS
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
@@ -1503,7 +1647,7 @@ static void queueStatsReport() {
     pRecord = getRecord(RECORD_TYPE_STATS);
 
     // Add the device ID
-    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, imei);  // -1 for terminator
+    contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, "%.*s", IMEI_LENGTH, r.imei);  // -1 for terminator
 
     // Add fatal count and types
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
@@ -1599,21 +1743,29 @@ static bool sendQueuedReports() {
     x = r.nextPubRecord;
     LOG_MSG("Sending report(s) (numRecordsQueued %d, nextPubRecord %d, currentRecord %d).\n", r.numRecordsQueued, x, r.currentRecord);
 
-    do {
+    while (x != r.currentRecord) {
         ASSERT (x < (sizeof (r.records) / sizeof (r.records[0])), FATAL_RECORDS_OVERRUN_3);
         LOG_MSG("Report %d: ", x);
         if (r.records[x].isUsed) {
             // This is something we want to publish, so first connect
+#ifdef SKIP_SEND
+            if (true) {
+#else
             if (connect()) {
+#endif
                 r.numPublishAttempts++;
+#ifdef SKIP_SEND
+                if (true) {
+#else
                 if (Particle.publish(recordTypeString[r.records[x].type], r.records[x].contents, 60, PRIVATE)) {
+#endif
                     LOG_MSG("sent %s.\n", r.records[x].contents);
                     // Keep track if we've sent a GPS report as, if we're in pre-operation mode,
                     // we can then go to sleep for longer.
                     if (r.records[x].type == RECORD_TYPE_GPS) {
                         atLeastOneGpsReportSent = true;
                     }
-                    freeRecord((&r.records[x]));
+                    freeRecord(&r.records[x]);
                     sentCount++;
                     // In the Particle code only four publish operations can be performed per second,
                     // so put in a 1 second delay every four
@@ -1641,8 +1793,7 @@ static bool sendQueuedReports() {
 
         // Increment x
         x = incModRecords(x);
-
-    } while (x != incModRecords(r.currentRecord));  // Loop until we've gone beyond the current record
+    }
 
     LOG_MSG("%ld report(s) sent, %ld failed to send.\n", sentCount, failedCount);
     // If there's been a publish failure and nextPubRecord is
@@ -1683,7 +1834,6 @@ static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
             LOG_MSG("Adding %d second(s) to this as we're in slow operation mode, so will actually wake up at %s.\n",
                     SLOW_MODE_INTERVAL_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
         }
-    
     } else {
         seconds = 0;
     }
@@ -1698,17 +1848,24 @@ static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
 void setup() {
     bool gpsConfigured = false;
     
+    // After a reset of the Electron board it takes a Windows PC several seconds
+    // to sort out what's happened to its USB interface, hence you need this
+    // delay if you're going to capture the serial output completely
+    delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
+
     // Set up retained memory, if required
     if (strcmp (r.key, RETAINED_INITIALISED) != 0) {
         resetRetained();
     }
     
+    if (r.warmStart) {
+        LOG_MSG("-> Starting after deep sleep.\n");
+    } else {
+        LOG_MSG("-> Starting from power-off.\n");
+    }
+    
     // Starting again
     r.numStarts++;
-    
-    // Set time to zero when we start so that we know if time
-    // is synchronised or not later on
-    Time.setTime(0);
     
     // Open up a Serial port to listen over USB
     Serial.begin(9600);
@@ -1718,58 +1875,66 @@ void setup() {
     pinMode(D7, OUTPUT);
     debugInd(DEBUG_IND_OFF);
 
-    // After a reset of the Electron board it takes a Windows PC several seconds
-    // to sort out what's happened to its USB interface, hence you need this
-    // delay if you're going to capture the serial output completely
-    delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
-    
+    // Get the IMEI of the modem module
+    if (r.imei[0] < '0') {
+        Cellular.on();
+        delay(MODEM_POWER_ON_DELAY_MILLISECONDS);
+        LOG_MSG("Getting IMEI...\n");
+        Cellular.command(getImeiCallBack, r.imei, 10000, "AT+CGSN\r\n");
+        Cellular.off();
+    } else {
+        LOG_MSG("IMEI is: %.*s.\n", IMEI_LENGTH, r.imei);
+    }
+
+    // Start the serial port for the GPS module
+    // and set D2 to be an output (driving power to the GPS module)
+    // NOTE: need to do this before establishing time as we access the
+    // GPS module during that process
+    Serial1.begin(9600);
+    Serial1.blockOnOverrun(true);
+    pinMode(D2, OUTPUT);
+    LOG_MSG("VCC applied to GPS module during setup.\n");
+    digitalWrite(D2, LOW);
+    delay(GPS_POWER_ON_DELAY_MILLISECONDS);
+
     // Establish time
     establishTime();
 
 #ifdef DISABLE_ACCELEROMETER
     accelerometerConnected = false;
 #else
-    // Set up all the necessary accelerometer bits
+    // Setup the accelerometer interface
     accelerometerConnected = accelerometer.begin();
-    if (accelerometerConnected) {
-        accelerometer.setActivityThreshold(ACCELEROMETER_ACTIVITY_THRESHOLD);
-        accelerometer.enableInterrupts();
+    if (!r.warmStart) {
+        // Configure the accelerometer as we've not done it before
+        if (accelerometer.configure()) {
+            accelerometer.setActivityThreshold(ACCELEROMETER_ACTIVITY_THRESHOLD);
+            accelerometer.enableInterrupts();
+        }
+    } else {
+        LOG_MSG("Skipping accelerometer configuration as this is a warm start.\n");
     }
 #endif
 
-    // Start the serial port for the GPS module
-    Serial1.begin(9600);
-    Serial1.blockOnOverrun(true);
-    
-    // Set D2 to be an output (driving power to the GPS module)
-    pinMode(D2, OUTPUT);
-    LOG_MSG("VCC applied to GPS module during setup.\n");
-
-    // Do the very initial configuration of GPS and then
-    // switch it off again.  This puts settings into battery
-    // backed RAM that can be restored later.
-    digitalWrite(D2, LOW);
-    delay(GPS_POWER_ON_DELAY_MILLISECONDS);
-    gpsConfigured = configureGps();
-    if (!gpsConfigured) {
-        LOG_MSG("WARNING: couldn't configure GPS but continuing anyway.\n");
-    }
-    digitalWrite(D2, HIGH);
-    LOG_MSG("VCC removed from GPS module at end of setup.\n");
-    delay(GPS_POWER_ON_DELAY_MILLISECONDS);
-    
-    // If a GPS fix had already been requested then make sure
-    // that GPS is switched on
-    if (r.gpsFixRequested && !gpsIsOn()) {
-        gpsOn();
+    if (!r.warmStart) {
+        // Do the very initial configuration of GPS and then
+        // switch it off again.  This puts settings into battery
+        // backed RAM that can be restored later.
+        gpsConfigured = configureGps();
+        if (!gpsConfigured) {
+            LOG_MSG("WARNING: couldn't configure GPS but continuing anyway.\n");
+        }
+    } else {
+        LOG_MSG("Skipping GPS configuration as this is a warm start.\n");
     }
     
-    // Set all the records used to false
-    memset (r.records, false, sizeof (r.records));
-
-    // Get the IMEI of the module
-    LOG_MSG("Getting IMEI...\n");
-    Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
+    // If GPS was on make sure it remains so
+    if (!r.gpsOn) {
+        digitalWrite(D2, HIGH);
+        LOG_MSG("VCC removed from GPS module at end of setup.\n");
+    } else {
+        LOG_MSG("Leaving VCC on to GPS as it was on before.\n");
+    }
 
     // Flash the LED to say that all is good
 #ifdef DISABLE_ACCELEROMETER
@@ -1782,7 +1947,8 @@ void setup() {
     
     // Setup is now complete
     setupCompleteSeconds = Time.now();
-    LOG_MSG("Started.\n");
+    r.warmStart = true;
+    LOG_MSG("Start-up completed.\n");
 }
 
 void loop() {
@@ -1804,8 +1970,18 @@ void loop() {
     
     // This only for info
     r.numLoops++;
-    LOG_MSG("-> Starting loop %d at %s UTC having slept since %s UTC (%d second(s) ago).\n", r.numLoops,
-            Time.timeStr().c_str(), Time.timeStr(r.sleepTime).c_str(), Time.now() - r.sleepTime);
+    LOG_MSG("-> Starting loop %d at %s UTC, having slept since %s UTC (%d second(s) ago).\n", r.numLoops,
+            Time.timeStr().c_str(), Time.timeStr(r.powerSaveTime).c_str(), Time.now() - r.powerSaveTime);
+
+    // If we are in slow operation override the stats timer period
+    // so that it is more frequent; it is useful to see these stats in
+    // this "slow operation" case to check that the device is doing well.
+    // Also make sure that we request a GPS fix, irrespective of whether
+    // we're moving or not, as that is also useful data.
+    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+        statsPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
+        r.gpsFixRequested = true;
+    }
 
     // See if we've moved
     inMotion = handleInterrupt();
@@ -1814,13 +1990,6 @@ void loop() {
         r.lastMotionSeconds = Time.now();
         r.numLoopsMotionDetected++;
         LOG_MSG("*** Motion was detected.\n");
-    }
-
-    // If we are in slow operation override the stats timer period
-    // so that it is more frequent; it is useful to see these stats in
-    // this "slow operation" case to check that the device is doing well.
-    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
-        statsPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
     }
 
     // Having valid time is fundamental to this program and so, if time
@@ -1838,23 +2007,32 @@ void loop() {
         if (Time.now() >= START_TIME_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
             uint32_t secondsSinceMidnight = Time.hour() * 3600 + Time.minute() * 60 + Time.second();
 
-            // IMEI retrieval can occasionally fail so check again here
-            if (imei[0] < '0') {
-                LOG_MSG("WARNING: trying to get IMEI again...\n");
-                Cellular.command(getImeiCallBack, imei, 10000, "AT+CGSN\r\n");
-            }
-
             // Check if we are inside the working day
             if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS) &&
                 (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS)) {
                     
-                LOG_MSG("Time to do something.\n");
+                LOG_MSG("It is during the working day.\n");
 
                 // During the working day we react to motion
                 wakeOnAccelerometer = true;
                     
+                // Queue a telemetry report, if required
+                if (Time.now() - r.lastTelemetrySeconds >= TELEMETRY_PERIOD_SECONDS) {
+                    r.lastTelemetrySeconds = Time.now();
+                    queueTelemetryReport();
+                    LOG_MSG("Forcing a send.\n");
+                    forceSend = true;
+                }
+
+                // Queue a stats report, if required
+                if (Time.now() - r.lastStatsSeconds >= statsPeriodSeconds) {
+                    r.lastStatsSeconds = Time.now();
+                    queueStatsReport();
+                }
+
                 // Queue a GPS report if we're in motion or can't tell if we're in motion
-                if (r.gpsFixRequested || !accelerometerConnected) {
+                // or if a send has been forced (at the telemetry interval)
+                if (r.gpsFixRequested || !accelerometerConnected || forceSend) {
                     r.numLoopsLocationNeeded++;
                     
                     if (!accelerometerConnected) {
@@ -1880,44 +2058,32 @@ void loop() {
                     gpsOff();
                 }
 
-                // Queue a telemetry report, if required
-                if (Time.now() - r.lastTelemetrySeconds >= TELEMETRY_PERIOD_SECONDS) {
-                    r.lastTelemetrySeconds = Time.now();
-                    queueTelemetryReport();
-                    LOG_MSG("Forcing a send.\n");
-                    forceSend = true;
-                }
-
-                // Queue a stats report, if required
-                if (Time.now() - r.lastStatsSeconds >= statsPeriodSeconds) {
-                    r.lastStatsSeconds = Time.now();
-                    queueStatsReport();
-                }
-
                 // Check if it's time to publish the queued reports
-                if (forceSend || ((Time.now() - r.lastReportSeconds >= REPORT_PERIOD_SECONDS) && (r.numRecordsQueued >= QUEUE_SEND_LEN))) {
+                if (forceSend || ((Time.now() - r.lastReportSeconds >= REPORT_PERIOD_SECONDS) || (r.numRecordsQueued >= QUEUE_SEND_LEN))) {
                     if (forceSend) {
                         LOG_MSG("Force Send was set.\n");
                     }
-
-                    atLeastOneGpsReportSent = sendQueuedReports();
                     
+                    if (r.numRecordsQueued >= QUEUE_SEND_LEN) {
+                        modemStaysAwake = true;
+                        LOG_MSG("Keeping modem awake while sleeping as we had a lot of records queued this time.\n");
+                    }
+                    
+                    atLeastOneGpsReportSent = sendQueuedReports();
                     r.lastReportSeconds = Time.now(); // Do this at the end as transmission could, potentially, take some time
                 }
 
-                // Sort out how long we can sleep for and whether the modem stays awake
-                modemStaysAwake = setTimings(secondsSinceMidnight, atLeastOneGpsReportSent, fixAchieved, &sleepForSeconds, &minSleepPeriodSeconds);
+                // Sort out how long we can sleep for
+                sleepForSeconds = setTimings(secondsSinceMidnight, atLeastOneGpsReportSent, fixAchieved, &minSleepPeriodSeconds);
                 
-                // Sending reports will have triggered connections.  If the number of connection
-                // failures is high, it might be a network or modem issue, so try putting everything to
-                // sleep to see if that recovers things
-                if (numConsecutiveConnectFailures > MAX_NUM_CONSECUTIVE_CONNECT_FAILURES) {
-                    modemStaysAwake = false;
-                    LOG_MSG("Failed to connect %d times, power-cycling modem and resetting on next sleep.\n", numConsecutiveConnectFailures);
+                // If we're in slow-mode, haven't sent a GPS report yet and are still within
+                // the time-window then stay awake
+                if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+                    if (!atLeastOneGpsReportSent && (Time.now() - setupCompleteSeconds <= SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
+                        modemStaysAwake = true;
+                        LOG_MSG("Keeping modem awake while sleeping as we're in the short \"slow mode\" wake-up.\n");
+                    }
                 }
-
-                // Back to sleep now
-                r.sleepTime = Time.now();
             } else {
                 // We're awake outside of the working day, calculate the time to the start of the working day
                 sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
@@ -1953,7 +2119,7 @@ void loop() {
     } // else condition of if() network time has been established
 
     // Print a load of informational stuff
-    LOG_MSG("Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d seconds.\n",
+    LOG_MSG("Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d second(s).\n",
              r.numLoops, sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
              Time.timeStr(Time.now() + sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str(), minSleepPeriodSeconds);
     LOG_MSG("The modem will be ");
@@ -1968,7 +2134,7 @@ void loop() {
     } else {
         LOG_MSG("OFF");
     }
-    LOG_MSG(", accelerometer will be ");
+    LOG_MSG(", the accelerometer will be ");
     if (wakeOnAccelerometer) {
         LOG_MSG("ON.\n");
     } else {
@@ -1980,7 +2146,7 @@ void loop() {
     
 #ifdef USB_DEBUG
     // Leave a little time for serial prints to leave the building before sleepy-byes
-    delay (500);
+    delay (1000);
 #endif
     
     // Now go to sleep for the allotted time.  If the accelerometer interrupt goes
@@ -2001,6 +2167,7 @@ void loop() {
             if (modemStaysAwake) {
                 // Sleep with the network connection up so that we can send reports
                 // without having to re-register
+                // System.sleep(SLEEP_MODE_DEEP, sleepForSeconds);
                 System.sleep(WKP, RISING, sleepForSeconds, SLEEP_NETWORK_STANDBY);
             } else {
                 // Otherwise we can go to deep sleep and will re-register when we awake

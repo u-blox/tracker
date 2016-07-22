@@ -25,6 +25,8 @@ public:
     
     /// Start the accelerometer.
     bool begin(void);
+    /// Configure the accelerometer.
+    bool configure(void);
     /// Read the accelerometer.  All pointers may be NULL.
     // \param pX X axis data.
     // \param pY Y axis data.
