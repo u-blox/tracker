@@ -99,7 +99,6 @@ bool Accelerometer::begin(void)
     Wire.setSpeed(CLOCK_SPEED_100KHZ);
     Wire.begin();
 
-    // Setup the ADI XL345 accelerometer
     // Reading register 0x00 should get us back 0xE5
     Wire.beginTransmission(ACCELEROMETER_ADDRESS);
     bytesWritten = Wire.write(0x00);
@@ -318,6 +317,36 @@ bool Accelerometer::setActivityThreshold(uint8_t threshold)
     }
 
     return success;
+}
+
+/// Check if interrupt are enabled
+bool Accelerometer::areInterruptsEnabled(void)
+{
+    uint8_t bytesWritten;
+    bool areEnabled = false;
+    uint8_t data[0];
+
+    // Read register 0x2E
+    Wire.beginTransmission(ACCELEROMETER_ADDRESS);
+    bytesWritten = Wire.write(0x2E);
+    Wire.endTransmission();
+    if (bytesWritten == 1) {
+        if (Wire.requestFrom(ACCELEROMETER_ADDRESS, (uint8_t) 1) == 1) {
+            data[0] = Wire.read();
+            if (data[0] != 0x00) {
+                areEnabled = true;
+                Serial.printf("Accelerometer I2C address 0x%02x, interrupts are enabled (0x%02x).\n", ACCELEROMETER_ADDRESS, data[0]);
+            } else {
+                Serial.printf("Accelerometer I2C address 0x%02x, interrupts are disabled.\n", ACCELEROMETER_ADDRESS);
+            }
+        } else {
+            Serial.printf("Accelerometer: I2C address 0x%02x, timeout reading value of register 0x00.\n", ACCELEROMETER_ADDRESS);
+        }
+    } else {
+        Serial.printf("Accelerometer: I2C address 0x%02x, unable to write the address of register 0x00.\n", ACCELEROMETER_ADDRESS);
+    }
+
+    return areEnabled;
 }
 
 /// Enable interrupts from the accelerometer

@@ -37,6 +37,9 @@ public:
     // \param threshold  the threshold to set.  The units are 62.5 mg steps.
     // \return true if the threshold was set successfully, otherwise false.
     bool setActivityThreshold(uint8_t threshold);
+    /// Check if interrupts are enabled.
+    // \return true if interrupts are enabled, otherwise false.
+    bool areInterruptsEnabled(void);
     /// Enable interrupts.
     // \return true if interrupts were switched on successfully, otherwise false.
     bool enableInterrupts(void);
