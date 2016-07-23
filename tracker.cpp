@@ -156,7 +156,7 @@
 #define GPS_FIX_2D
 
 /// Define this to skip the actual sending.
-#define SKIP_SEND
+//#define SKIP_SEND
 
 /****************************************************************
  * CONFIGURATION MACROS
@@ -237,12 +237,14 @@
 
 /// The start time for the device (in Unix, UTC).
 // If the device wakes up before this time it will return
-// to deep sleep.
+// to deep sleep.  After this time it will work in slow operation
+// and will wake up at SLOW_MODE_INTERVAL_SECONDS after the time below
+// for SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS each time.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
 #ifdef DEV_BUILD
-# define START_TIME_UNIX_UTC 1466586000 // 22 June 2016 @ 09:00 UTC
+# define START_TIME_UNIX_UTC 1469318400 // 24th July 2016 @ 00:00 UTC
 #else
-# define START_TIME_UNIX_UTC 1469663999 // 27th July 2016 @ 23:59:59 UTC
+# define START_TIME_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
 #endif
 
 /// The number of times to wake-up during the working day when in slow operation.
@@ -256,13 +258,12 @@
 /// The start time for full working day operation (in Unix, UTC).
 // After this time the device will be awake for the whole working day and send reports
 // as necessary.
-// This time must be later than or equal to START_TIME_UNIX_UTC and should begin
-// at the same time as the start of the working day.
+// This time must be later than or equal to START_TIME_UNIX_UTC.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
 #ifdef DEV_BUILD
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1466586000 // 22 June 2016 @ 09:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469426400 // 25th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1468134000 // 10 July 2016 @ 07:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
 #endif
 
 /// Start of day in seconds after midnight UTC.
@@ -2116,6 +2117,9 @@ void loop() {
                 r.modemStaysAwake = false;
             } // else condition of if() it's time to do something
         } else {
+            // Clear the retained variables as we'd like a fresh start when we awake
+            resetRetained();
+
             // We're awake when we shouldn't have started operation at all yet, calculate new wake-up time
             r.sleepForSeconds = START_TIME_UNIX_UTC - Time.now() - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
            // Make sure GPS and the modem are off
@@ -2125,9 +2129,6 @@ void loop() {
             // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
             if (Time.now() + r.sleepForSeconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
                 r.sleepForSeconds += SLOW_MODE_INTERVAL_SECONDS;
-                // Set these to zero to make sure they activate at that time
-                r.lastTelemetrySeconds = 0;
-                r.lastStatsSeconds = 0;
             }
 
             if (r.sleepForSeconds > 0) {
@@ -2137,9 +2138,6 @@ void loop() {
             } else {
                 r.sleepForSeconds = 0;
             }
-
-            // Also, clear the retained variables as we'd like a fresh start when we awake
-            resetRetained();
         } // else condition of if() time >= START_TIME_UNIX_UTC
 
         // Record the time we went into power saving state (only if we have established time though)
