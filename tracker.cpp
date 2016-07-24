@@ -155,8 +155,8 @@
 /// Define this if a 2D GPS fix is sufficient.
 #define GPS_FIX_2D
 
-/// Define this to skip the actual sending.
-//#define SKIP_SEND
+/// Define this to skip doing anything with the cellular connection.
+//#define DISABLE_CELLULAR_CONNECTION
 
 /****************************************************************
  * CONFIGURATION MACROS
@@ -185,12 +185,9 @@
 
 /// If the system cannot establish time by talking to the 
 // Particle server, wait this long and try again.
-// NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS.
 #define TIME_SYNC_RETRY_PERIOD_SECONDS 30
 
 /// The time between wake-ups as a result of motion being detected.
-// NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS
-// when in USB_DEBUG mode.
 #define MIN_MOTION_PERIOD_SECONDS 30
 #define MAX_MOTION_PERIOD_SECONDS (60 * 5)
 
@@ -206,9 +203,7 @@
 
 /// The minimum interval between wake-ups, to allow us to
 // sleep if the accelerometer is being triggered a lot
-// NOTE: must be bigger than WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS
-// when in USB_DEBUG mode.
-#define MIN_SLEEP_PERIOD_SECONDS 6
+#define MIN_SLEEP_PERIOD_SECONDS 5
 
 /// The periodicity of telemetry reports.
 #define TELEMETRY_PERIOD_SECONDS (3600 * 8)
@@ -219,7 +214,7 @@
 /// The report period in seconds.  At this interval the
 // queued-up records are sent (though they may be sent
 // earlier if QUEUE_SEND_LEN is reached).
-# define REPORT_PERIOD_SECONDS (60 * 15)
+# define REPORT_PERIOD_SECONDS (60 * 10)
 
 /// The queue length at which to begin sending records.
 #define QUEUE_SEND_LEN 4
@@ -237,12 +232,13 @@
 
 /// The start time for the device (in Unix, UTC).
 // If the device wakes up before this time it will return
-// to deep sleep.  After this time it will work in slow operation
-// and will wake up at SLOW_MODE_INTERVAL_SECONDS after the time below
-// for SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS each time.
+// to deep sleep.  After this time it will work in slow operation,
+// waking up at SLOW_MODE_INTERVAL_SECONDS after the start of the
+// working day for up to SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS
+// each time.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
 #ifdef DEV_BUILD
-# define START_TIME_UNIX_UTC 1469318400 // 24th July 2016 @ 00:00 UTC
+# define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
 # define START_TIME_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
 #endif
@@ -401,6 +397,8 @@ typedef struct {
     time_t lastReportSeconds;
     // The time that motion was last detected
     time_t lastMotionSeconds;
+    // The time of the last cold start
+    time_t lastColdStartSeconds;
     // Whether we've asked for a GPS fix or not
     bool gpsFixRequested;
     // The records accumulated
@@ -463,9 +461,6 @@ const char * recordTypeString[] = {"null", "telemetry", "gps", "stats"};
 /// Whether we have an accelerometer or not
 bool accelerometerConnected = false;
 
-/// The time at which setup was finished.
-time_t setupCompleteSeconds = 0;
-
 /// The stats period, stored in RAM so that it can
 // be overridden.
 time_t statsPeriodSeconds = STATS_PERIOD_SECONDS;
@@ -509,8 +504,8 @@ Accelerometer accelerometer = Accelerometer();
 /// Instantiate a fuel gauge.
 FuelGauge fuel;
 
-/// Only connect when it is required.
-SYSTEM_MODE(SEMI_AUTOMATIC);
+/// Only connect when we say so.
+SYSTEM_MODE(MANUAL);
 
 /// Enable retained memory.
 STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
@@ -536,14 +531,12 @@ STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
 static uint32_t littleEndianUint32(uint8_t *pByte);
 static bool handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
-static int getImeiCallBack(int type, const char* pBuf, int len, char * pImei);
 static void printHex(const char *pBytes, uint32_t lenBytes);
 int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck);
 static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds);
 static bool configureGps();
 static bool gotGpsFix(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
 static bool gpsSetTime(time_t unixTimeUtc);
-static bool isLeapYear(uint32_t year);
 static bool gpsGetTime(time_t *pUnixTimeUtc);
 static bool gpsCanPowerSave();
 static void resetRetained();
@@ -551,10 +544,14 @@ static time_t gpsOn();
 static bool gpsOff();
 static bool gpsIsOn();
 static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, float *pHdop);
+static int getImeiCallBack(int type, const char* pBuf, int len, char * pImei);
 static bool connect();
+static bool isLeapYear(uint32_t year);
 static bool establishTime();
 static time_t getSleepTime(time_t lastTime, time_t period);
 static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pMinSleepPeriodSeconds);
+static uint32_t secondsInDayToWorkingDayStart(uint32_t secondsToday);
+static time_t truncateToDay(time_t unixTime);
 static char * getRecord(RecordType_t type);
 static void freeRecord(Record_t *pRecord);
 static uint32_t incModRecords (uint32_t x);
@@ -562,10 +559,9 @@ static void queueTelemetryReport();
 static void queueGpsReport(float latitude, float longitude, bool motion, float hdop);
 static void queueStatsReport();
 static bool sendQueuedReports();
-static uint32_t secondsToWorkingDayStart(uint32_t secondsToday);
 
 /****************************************************************
- * STATIC FUNCTIONS
+ * STATIC FUNCTIONS: MISC
  ***************************************************************/
 
 /// Return a uint32_t from a pointer to a little-endian uint32_t
@@ -624,6 +620,10 @@ static int getImeiCallBack(int type, const char* pBuf, int len, char* pImei) {
 
     return WAIT;
 }
+
+/****************************************************************
+ * STATIC FUNCTIONS: DEBUG
+ ***************************************************************/
 
 /// Use the LED on the board (on D7) for debug indications.
 static void debugInd(DebugInd_t debugInd) {
@@ -702,6 +702,10 @@ static void printHex(const uint8_t *pBytes, uint32_t lenBytes)
         LOG_MSG("%.2s-", hexChar);
     }
 }
+
+/****************************************************************
+ * STATIC FUNCTIONS: GPS
+ ***************************************************************/
 
 /// Send a u-blox format message to the GPS module.
 int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck)
@@ -1012,19 +1016,6 @@ static bool gpsSetTime(time_t unixTimeUtc) {
     return success;
 }
 
-/// Check if a year is a leap year
-static bool isLeapYear(uint32_t year) {
-    bool leapYear = false;
-
-    if (year % 400 == 0) {
-        leapYear = true;
-    } else if (year % 4 == 0) {
-        leapYear = true;
-    }
-
-    return leapYear;
-}
-
 /// Read the time from the GPS module
 static bool gpsGetTime(time_t *pUnixTimeUtc) {
     time_t gpsTime = 0;
@@ -1103,7 +1094,11 @@ static bool gpsCanPowerSave() {
     
     if (gpsIsOn()) {
         LOG_MSG("GPS has been on for %d second(s).\n", Time.now() - r.gpsPowerOnTime);
-        if (Time.now() - r.gpsPowerOnTime < GPS_MAX_ON_TIME_SECONDS) {
+        // Time GPS out if we're outside the maximum time and are in full working-day
+        // operation.  NOTE: if we're in "slow mode" operation, rather than full
+        // working-day operation, we want to try our damndest and will power GPS
+        // off anyway at the end of the short "slow mode" wakeup.
+        if ((Time.now() - r.gpsPowerOnTime < GPS_MAX_ON_TIME_SECONDS) || (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC)) {
             uint32_t powerSaveState = 0;
             uint32_t numEntries = 0;
             uint32_t numEphemerisData = 0;
@@ -1321,10 +1316,17 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
     return fixAchieved;
 }
 
+/****************************************************************
+ * STATIC FUNCTIONS: MODEM
+ ***************************************************************/
+
 /// Connect to the network, returning true if successful.
 static bool connect() {
     bool success = false;
     
+#ifdef DISABLE_CELLULAR_CONNECTION
+    success = true;
+#else
     if (Particle.connected()) {
         success = true;
         numConsecutiveConnectFailures = 0;
@@ -1341,8 +1343,26 @@ static bool connect() {
             LOG_MSG("WARNING: connection failed.\n");
         }
     }
+#endif
     
     return success;
+}
+
+/****************************************************************
+ * STATIC FUNCTIONS: TIME
+ ***************************************************************/
+
+/// Check if a year is a leap year
+static bool isLeapYear(uint32_t year) {
+    bool leapYear = false;
+
+    if (year % 400 == 0) {
+        leapYear = true;
+    } else if (year % 4 == 0) {
+        leapYear = true;
+    }
+
+    return leapYear;
 }
 
 /// Make sure we have time sync.
@@ -1366,10 +1386,10 @@ static bool establishTime() {
     
     if (Time.now() > MIN_TIME_UNIX_UTC) {
         success = true;
-        if (setupCompleteSeconds <= MIN_TIME_UNIX_UTC) {
+        if (r.lastColdStartSeconds <= MIN_TIME_UNIX_UTC) {
             // If we didn't already have time established when we left setup(),
             // reset it to a more correct time here.
-            setupCompleteSeconds = Time.now();
+            r.lastColdStartSeconds = Time.now();
         }
     } else {
         LOG_MSG("WARNING: unable to establish time (time now is %d).\n", Time.now());
@@ -1396,14 +1416,14 @@ static time_t getSleepTime(time_t lastTime, time_t period) {
 /// Sort out our timings after waking up to do something
 static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReportSent, bool fixAchieved, time_t *pMinSleepPeriodSeconds) {
     time_t x;
+    uint32_t numIntervalsPassed;
     time_t minSleepPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
     time_t sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
 
     if (Time.now() >= START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
-        // We're in full working day operation
         // Begin by setting the sleep time to the longest possible time
         sleepForSeconds = TELEMETRY_PERIOD_SECONDS;
-        LOG_MSG("Next wake-up set to %d second(s).\n", sleepForSeconds);
+        LOG_MSG("In full working day operation, setting next wake-up in %d seconds.\n", sleepForSeconds);
         
         // Check if we're doing a GPS fix (after motion was triggered)
         if (gpsIsOn()) {
@@ -1457,31 +1477,32 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
             LOG_MSG("  Min sleep time, %d, is less than the sleep time we want, setting min sleep time to %d second(s).\n", minSleepPeriodSeconds, sleepForSeconds);
             minSleepPeriodSeconds = sleepForSeconds;
         }
-
-        LOG_MSG("Final sleep time setting is %d second(s).\n", sleepForSeconds);
-
-        // Take into account the settling time
-        sleepForSeconds -= WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-        if (sleepForSeconds < 0) {
-            sleepForSeconds = 0;
-        }
     } else {
+        LOG_MSG("In \"slow mode\" operation, next wake-up set to %d second(s).\n", sleepForSeconds);
         // But, if at least one GPS report has been sent, or we've ended this slow
         // operation wake-up, then we can go to deep sleep until the interval expires
-        if (atLeastOneGpsReportSent || (Time.now() - setupCompleteSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
-            uint32_t numIntervalsPassed = (secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS) / SLOW_MODE_INTERVAL_SECONDS;
+        if (atLeastOneGpsReportSent || (Time.now() - r.lastColdStartSeconds > SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
+            x = secondsSinceMidnight - START_OF_WORKING_DAY_SECONDS;
+            if (x < 0) {
+                x = 0;
+            }
+            numIntervalsPassed = x / SLOW_MODE_INTERVAL_SECONDS;
+            LOG_MSG("  This \"slow mode\" wake-up (number %d) is complete.\n", numIntervalsPassed);
             sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
-                              secondsSinceMidnight - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+                              secondsSinceMidnight;
             if (sleepForSeconds < 0) {
                 sleepForSeconds = 0;
             }
+            LOG_MSG("  Next wake-up set to %d second(s).\n", sleepForSeconds);
             // If we would be waking up after the end of the working day, have a proper sleep instead
-            if (secondsSinceMidnight + sleepForSeconds >
-                START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
-                sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
+            if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
+                sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
+                LOG_MSG("  But that would be after the end of the working day, so sleeping for %d second(s) instead.\n", sleepForSeconds);
             }
         }
     }
+
+    LOG_MSG("Final sleep time setting is %d second(s).\n", sleepForSeconds);
 
     // Set the variable passed in
     if (pMinSleepPeriodSeconds != NULL) {
@@ -1490,6 +1511,50 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
     
     return sleepForSeconds;
 }
+
+/// Calculate the number of seconds in the day to the start of the working day.
+static uint32_t secondsInDayToWorkingDayStart(uint32_t secondsToday) {
+    uint32_t seconds = 0;
+    
+    // We're awake outside the working day, calculate the new wake-up time
+    if (secondsToday < START_OF_WORKING_DAY_SECONDS) {
+        seconds = START_OF_WORKING_DAY_SECONDS - secondsToday;
+    } else {
+        if (secondsToday > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
+            // After the end of the day, so wake up next tomorrow morning
+            seconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsToday;
+        }
+    }
+    
+    if (seconds > 0) {
+        LOG_MSG("Time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d, going back to sleep for %d second(s) in order to wake up at %s.\n",
+                Time.hour(), Time.minute(), Time.second(),
+                Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
+                Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
+                Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
+                seconds, Time.timeStr(Time.now() + seconds).c_str());
+    }
+    // If we will still be in slow mode when we awake, no need to wake up until the first slow-operation
+    // wake-up time
+    if (Time.now() + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+        seconds += SLOW_MODE_INTERVAL_SECONDS;
+        LOG_MSG("Adding %d second(s) to wake-up time as we're in slow operation mode, so will actually wake up at %s.\n",
+                SLOW_MODE_INTERVAL_SECONDS, Time.timeStr(Time.now() + seconds).c_str());
+    }
+    
+    return seconds;
+}
+
+/// Work out the unix time for midnight on a given day.  In other
+// words, truncate a unixTime to a day (so 08:00 on 24th June becomes
+// 00:00 on 24th June).
+static time_t truncateToDay(time_t unixTime) {
+    return (unixTime / (3600 * 24)) * 3600 * 24;
+}
+
+/****************************************************************
+ * STATIC FUNCTIONS: REPORTS
+ ***************************************************************/
 
 /// Get a new record from the list.
 static char * getRecord(RecordType_t type) {
@@ -1752,13 +1817,9 @@ static bool sendQueuedReports() {
         LOG_MSG("Report %d: ", x);
         if (r.records[x].isUsed) {
             // This is something we want to publish, so first connect
-#ifdef SKIP_SEND
-            if (true) {
-#else
             if (connect()) {
-#endif
                 r.numPublishAttempts++;
-#ifdef SKIP_SEND
+#ifdef DISABLE_CELLULAR_CONNECTION
                 if (true) {
 #else
                 if (Particle.publish(recordTypeString[r.records[x].type], r.records[x].contents, 60, PRIVATE)) {
@@ -1808,41 +1869,6 @@ static bool sendQueuedReports() {
     }
 
     return atLeastOneGpsReportSent;
-}
-
-/// Calculate the number of seconds to the start of the working day.
-static uint32_t secondsToWorkingDayStart(uint32_t secondsToday) {
-    uint32_t seconds = 0;
-    
-    // We're awake outside the working day, calculate the new wake-up time
-    if (secondsToday < START_OF_WORKING_DAY_SECONDS) {
-        seconds = START_OF_WORKING_DAY_SECONDS - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-    } else {
-        if (secondsToday > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
-            // After the end of the day, so wake up next tomorrow morning
-            seconds = START_OF_WORKING_DAY_SECONDS + (3600 * 24) - secondsToday - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-        }
-    }
-    
-    if (seconds > 0) {
-        LOG_MSG("Awake outside the working day (time now %02d:%02d:%02d UTC, working day is %02d:%02d:%02d to %02d:%02d:%02d), going back to sleep for %d second(s) in order to wake up at %s.\n",
-                Time.hour(), Time.minute(), Time.second(),
-                Time.hour(START_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS), Time.second(START_OF_WORKING_DAY_SECONDS),
-                Time.hour(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS), Time.minute(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
-                Time.second(START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS),
-                seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
-        // If we will still be in slow mode when we awake, no need to wake up until the first slow-operation
-        // wake-up time
-        if (Time.now() + seconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
-            seconds += SLOW_MODE_INTERVAL_SECONDS;
-            LOG_MSG("Adding %d second(s) to this as we're in slow operation mode, so will actually wake up at %s.\n",
-                    SLOW_MODE_INTERVAL_SECONDS, Time.timeStr(Time.now() + seconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
-        }
-    } else {
-        seconds = 0;
-    }
-    
-    return seconds;
 }
 
 /****************************************************************
@@ -1951,9 +1977,11 @@ void setup() {
     }
     
     // Setup is now complete
-    setupCompleteSeconds = Time.now();
-    // All future starts are warm starts
-    r.warmStart = true;
+    if (!r.warmStart) {
+        r.lastColdStartSeconds = Time.now();
+        // All future starts are warm starts
+        r.warmStart = true;
+    }
     LOG_MSG("Start-up completed.\n");
 }
 
@@ -1997,7 +2025,7 @@ void loop() {
         }
 
         // Check if we should be awake at all
-        if (Time.now() >= START_TIME_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
+        if (Time.now() >= START_TIME_UNIX_UTC) {
             uint32_t secondsSinceMidnight = Time.hour() * 3600 + Time.minute() * 60 + Time.second();
 
             // Check if we are inside the working day
@@ -2089,18 +2117,26 @@ void loop() {
                         r.lastReportSeconds = Time.now(); // Do this at the end as transmission could, potentially, take some time
                     }
     
+                    // If we're in slow-mode, haven't sent a GPS report yet and are still within
+                    // the time-window then stay awake, otherwise shut the modem and GPS down
+                    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+                        if (!atLeastOneGpsReportSent && (Time.now() - r.lastColdStartSeconds <= SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
+                            r.modemStaysAwake = true;
+                            LOG_MSG("Keeping modem awake while sleeping as we're in the short \"slow mode\" wake-up.\n");
+                        } else {
+                            // Clear the retained variables as we'd like a fresh start when we awake
+                            resetRetained();
+                            LOG_MSG("Switching modem and GPS off at the end of this \"slow mode\" wake-up.\n");
+                            gpsOff();
+                            r.modemStaysAwake = false;
+                            wakeOnAccelerometer = false;
+                        }
+                    }
+                    
                     // Sort out how long we can sleep for
                     r.sleepForSeconds = setTimings(secondsSinceMidnight, atLeastOneGpsReportSent, fixAchieved, &r.minSleepPeriodSeconds);
                     
-                    // If we're in slow-mode, haven't sent a GPS report yet and are still within
-                    // the time-window then stay awake
-                    if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
-                        if (!atLeastOneGpsReportSent && (Time.now() - setupCompleteSeconds <= SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
-                            r.modemStaysAwake = true;
-                            LOG_MSG("Keeping modem awake while sleeping as we're in the short \"slow mode\" wake-up.\n");
-                        }
-                    }
-                } else { // else condition of if() we've woken up too early
+                } else { // if() we've woken up early
                     // If we have awoken early, put us back to sleep again for the remaining sleep time
                     r.sleepForSeconds = r.minSleepPeriodSeconds - (Time.now() - r.sleepStartSeconds);
                     if (r.sleepForSeconds < 0) {
@@ -2108,56 +2144,57 @@ void loop() {
                     }
                     r.minSleepPeriodSeconds = r.sleepForSeconds;
                     LOG_MSG("Interrupt woke us up early, going back to bed for %d second(s) with interrupts off this time.\n", r.sleepForSeconds);
-                }
-            } else {
+                } // else condition of if() we've woken up early
+            } else { // if() we're inside the working day
+                LOG_MSG("Awake outside the working day.\n");
+                // Clear the retained variables as we'd like a fresh start when we awake
+                resetRetained();
                 // We're awake outside of the working day, calculate the time to the start of the working day
-                r.sleepForSeconds = secondsToWorkingDayStart(secondsSinceMidnight);
+                r.sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
                // Make sure GPS and the modem are off
                 gpsOff();
                 r.modemStaysAwake = false;
-            } // else condition of if() it's time to do something
-        } else {
+            } // else condition of if() we're inside the working day
+        } else { // if() time >= START_TIME_UNIX_UTC
+            LOG_MSG("Awake before start time (time now %s UTC, start time %s UTC).\n", 
+                    Time.timeStr().c_str(), Time.timeStr(START_TIME_UNIX_UTC).c_str());
             // Clear the retained variables as we'd like a fresh start when we awake
             resetRetained();
 
             // We're awake when we shouldn't have started operation at all yet, calculate new wake-up time
-            r.sleepForSeconds = START_TIME_UNIX_UTC - Time.now() - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
-           // Make sure GPS and the modem are off
+            r.sleepForSeconds = START_TIME_UNIX_UTC - Time.now();
+            // Make sure GPS and the modem are off
             gpsOff();
             r.modemStaysAwake = false;
 
             // If we will still be in slow mode when we awake, no need to wake up until the first interval of the working day expires
-            if (Time.now() + r.sleepForSeconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS) {
-                r.sleepForSeconds += SLOW_MODE_INTERVAL_SECONDS;
-            }
-
-            if (r.sleepForSeconds > 0) {
-                LOG_MSG("Awake too early (time now %s UTC, expected start time %s UTC), going back to sleep for %d second(s) in order to wake up at %s.\n",
-                        Time.timeStr().c_str(), Time.timeStr(START_TIME_UNIX_UTC).c_str(), r.sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
-                        Time.timeStr(Time.now() + r.sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str());
-            } else {
-                r.sleepForSeconds = 0;
+            if (Time.now() + r.sleepForSeconds < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+                r.sleepForSeconds = truncateToDay(START_TIME_UNIX_UTC) - Time.now() + START_OF_WORKING_DAY_SECONDS + SLOW_MODE_INTERVAL_SECONDS;
             }
         } // else condition of if() time >= START_TIME_UNIX_UTC
 
         // Record the time we went into power saving state (only if we have established time though)
         r.powerSaveTime = Time.now();
-
     } else {
-        r.sleepForSeconds = TIME_SYNC_RETRY_PERIOD_SECONDS - WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS;
+        r.sleepForSeconds = TIME_SYNC_RETRY_PERIOD_SECONDS;
         // Make sure GPS is off
         gpsOff();
-        // Keep the modem awake in this case as we really want to establish network time
+        // Keep the modem awake in this case as we will want to establish network time
         r.modemStaysAwake = true;
     } // else condition of if() network time has been established
 
+    // Catch negative sleep times
+    if (r.sleepForSeconds < 0) {
+        r.sleepForSeconds = 0;
+    }
+    
     // Print a load of informational stuff
     LOG_MSG("Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d second(s).\n",
-             r.numLoops, r.sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS,
-             Time.timeStr(Time.now() + r.sleepForSeconds + WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS).c_str(), r.minSleepPeriodSeconds);
+             r.numLoops, r.sleepForSeconds,
+             Time.timeStr(Time.now() + r.sleepForSeconds).c_str(), r.minSleepPeriodSeconds);
     LOG_MSG("The modem will be ");
     if (r.modemStaysAwake) {
-        LOG_MSG("ON");
+        LOG_MSG(" left awake if awake");
     } else {
         LOG_MSG("OFF");
     }
@@ -2167,12 +2204,13 @@ void loop() {
     } else {
         LOG_MSG("OFF");
     }
-    LOG_MSG(", the accelerometer will be ");
+    LOG_MSG(", we ");
     if (wakeOnAccelerometer) {
-        LOG_MSG("ON.\n");
+        LOG_MSG("WILL");
     } else {
-        LOG_MSG("OFF.\n");
+        LOG_MSG("will NOT");
     }
+    LOG_MSG(" wake on movement.\n");
 
     // Make sure the debug LED is off to save power
     debugInd(DEBUG_IND_OFF);
@@ -2184,15 +2222,15 @@ void loop() {
     
     // Now go to sleep for the allotted time.  If the accelerometer interrupt goes
     // off it will wake us up and then be reset when we eventually awake.
-    if (wakeOnAccelerometer) {
-        if (accelerometerConnected) {
-            accelerometer.enableInterrupts();
-        }
-        // The system calls here will wake up when the WKP pin rises due to the
-        // accelerometer interrupt going off (even the call that doesn't explicitly
-        // mention that pin).
-        r.sleepStartSeconds = Time.now();
-        if (r.sleepForSeconds > 0) {
+    if (r.sleepForSeconds > 0) {
+        if (wakeOnAccelerometer) {
+            if (accelerometerConnected) {
+                accelerometer.enableInterrupts();
+            }
+            // The system calls here will wake up when the WKP pin rises due to the
+            // accelerometer interrupt going off (even the call that doesn't explicitly
+            // mention that pin).
+            r.sleepStartSeconds = Time.now();
             if (r.modemStaysAwake) {
                 // Sleep with the network connection up so that we can send reports
                 // without having to re-register
@@ -2203,14 +2241,14 @@ void loop() {
                 // retained variables will be kept
                 System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
             }
+        } else {
+            if (accelerometerConnected) {
+                accelerometer.disableInterrupts();
+            }
+            // Nice deep sleep otherwise.
+            // NOTE: we will come back from reset after this, only the
+            // retained variables will be kept
+            System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
         }
-    } else {
-        if (accelerometerConnected) {
-            accelerometer.disableInterrupts();
-        }
-        // Nice deep sleep otherwise.
-        // NOTE: we will come back from reset after this, only the
-        // retained variables will be kept
-        System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
     }
 }
