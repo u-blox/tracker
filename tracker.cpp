@@ -2075,8 +2075,7 @@ void loop() {
                     }
     
                     // Queue a GPS report if we're in motion or can't tell if we're in motion
-                    // or if a send has been forced (at the telemetry interval)
-                    if (r.gpsFixRequested || !accelerometerConnected || forceSend) {
+                    if (r.gpsFixRequested || !accelerometerConnected) {
                         r.numLoopsLocationNeeded++;
                         
                         if (!accelerometerConnected) {
