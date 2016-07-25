@@ -1490,14 +1490,14 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
             LOG_MSG("  This \"slow mode\" wake-up (number %d) is complete.\n", numIntervalsPassed);
             sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
                               secondsSinceMidnight;
-            if (sleepForSeconds < 0) {
-                sleepForSeconds = 0;
-            }
-            LOG_MSG("  Next wake-up set to %d second(s).\n", sleepForSeconds);
-            // If we would be waking up after the end of the working day, have a proper sleep instead
-            if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
-                sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
-                LOG_MSG("  But that would be after the end of the working day, so sleeping for %d second(s) instead.\n", sleepForSeconds);
+            LOG_MSG("  Next \"slow mode\" wake-up set to %d second(s).\n", sleepForSeconds);
+            if (Time.now() + sleepForSeconds >= START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
+                sleepForSeconds = START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - Time.now();
+                LOG_MSG("  But by that time we would be in full working day operation, so sleeping for %d second(s) instead.\n", sleepForSeconds);
+            } else if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
+                    sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
+                    LOG_MSG("  But that would be after the end of the working day, so sleeping for %d second(s) instead.\n", sleepForSeconds);
+                }
             }
         }
     }
@@ -2194,7 +2194,7 @@ void loop() {
              Time.timeStr(Time.now() + r.sleepForSeconds).c_str(), r.minSleepPeriodSeconds);
     LOG_MSG("The modem will be ");
     if (r.modemStaysAwake) {
-        LOG_MSG(" left awake if awake");
+        LOG_MSG("left awake if awake");
     } else {
         LOG_MSG("OFF");
     }
