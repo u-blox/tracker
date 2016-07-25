@@ -162,6 +162,30 @@
  * CONFIGURATION MACROS
  ***************************************************************/
 
+/// The start time for the device (in Unix, UTC).
+// If the device wakes up before this time it will return
+// to deep sleep.  After this time it will work in slow operation,
+// waking up at SLOW_MODE_INTERVAL_SECONDS after the start of the
+// working day for up to SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS
+// each time.
+// Use http://www.onlineconversion.com/unix_time.htm to work this out.
+#ifdef DEV_BUILD
+# define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
+#else
+# define START_TIME_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
+#endif
+
+/// The start time for full working day operation (in Unix, UTC).
+// After this time the device will be awake for the whole working day and send reports
+// as necessary.
+// This time must be later than or equal to START_TIME_UNIX_UTC.
+// Use http://www.onlineconversion.com/unix_time.htm to work this out.
+#ifdef DEV_BUILD
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469599200 // 27th July 2016 @ 06:00 UTC
+#else
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
+#endif
+
 /// The version string of this software (an incrementing integer)
 #define SW_VERSION 3
 
@@ -230,19 +254,6 @@
 // before we take further action.
 #define MAX_NUM_CONSECUTIVE_CONNECT_FAILURES 5
 
-/// The start time for the device (in Unix, UTC).
-// If the device wakes up before this time it will return
-// to deep sleep.  After this time it will work in slow operation,
-// waking up at SLOW_MODE_INTERVAL_SECONDS after the start of the
-// working day for up to SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS
-// each time.
-// Use http://www.onlineconversion.com/unix_time.htm to work this out.
-#ifdef DEV_BUILD
-# define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
-#else
-# define START_TIME_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
-#endif
-
 /// The number of times to wake-up during the working day when in slow operation.
 #define SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY 1
 
@@ -250,17 +261,6 @@
 // slow operation.  After this time, or as soon as a GPS fix has been established
 // and transmitted, we can go to deep sleep.
 #define SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS (60 * 10)
-
-/// The start time for full working day operation (in Unix, UTC).
-// After this time the device will be awake for the whole working day and send reports
-// as necessary.
-// This time must be later than or equal to START_TIME_UNIX_UTC.
-// Use http://www.onlineconversion.com/unix_time.htm to work this out.
-#ifdef DEV_BUILD
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469426400 // 25th July 2016 @ 06:00 UTC
-#else
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
-#endif
 
 /// Start of day in seconds after midnight UTC.
 #define START_OF_WORKING_DAY_SECONDS (3600 * 0) // 00:00 UTC
@@ -1272,7 +1272,6 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
         }
     }
 
-    LOG_MSG("\n");
     if (fixAchieved){
         LOG_MSG("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f, elevation: %.3f m",
                 Time.now() - startTimeSeconds, *pLatitude, *pLongitude, *pElevation);
@@ -1309,8 +1308,6 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
                 LOG_MSG("No response.");
             }
         }
-    } else {
-        LOG_MSG("No fix this time.\n");
     }
     
     return fixAchieved;
@@ -1487,9 +1484,16 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
                 x = 0;
             }
             numIntervalsPassed = x / SLOW_MODE_INTERVAL_SECONDS;
-            LOG_MSG("  This \"slow mode\" wake-up (number %d) is complete.\n", numIntervalsPassed);
+            if (numIntervalsPassed == 0) {
+                LOG_MSG("  Initialisation wake-up in \"slow mode\" is complete.\n");
+            } else {
+                LOG_MSG("  This \"slow mode\" wake-up (%d of %d each working day) is complete.\n", numIntervalsPassed, SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY);
+            }
             sleepForSeconds = START_OF_WORKING_DAY_SECONDS + (numIntervalsPassed + 1) * SLOW_MODE_INTERVAL_SECONDS -
                               secondsSinceMidnight;
+            if (numIntervalsPassed >= SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY) {
+                sleepForSeconds = (3600 * 24) - secondsSinceMidnight + START_OF_WORKING_DAY_SECONDS + SLOW_MODE_INTERVAL_SECONDS;
+            }
             LOG_MSG("  Next \"slow mode\" wake-up set to %d second(s).\n", sleepForSeconds);
             if (Time.now() + sleepForSeconds >= START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
                 sleepForSeconds = START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - Time.now();
@@ -1497,7 +1501,6 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
             } else if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
                     sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
                     LOG_MSG("  But that would be after the end of the working day, so sleeping for %d second(s) instead.\n", sleepForSeconds);
-                }
             }
         }
     }
@@ -1889,9 +1892,9 @@ void setup() {
     }
     
     if (r.warmStart) {
-        LOG_MSG("-> Start-up after deep sleep.\n");
+        LOG_MSG("\n-> Start-up after deep sleep.\n");
     } else {
-        LOG_MSG("-> Start-up from power-off.\n");
+        LOG_MSG("\n-> Start-up from power-off.\n");
     }
     
     // Starting again
@@ -2001,7 +2004,7 @@ void loop() {
     
     // This only for info
     r.numLoops++;
-    LOG_MSG("-> Starting loop %d at %s UTC, having slept since %s UTC (%d second(s) ago).\n", r.numLoops,
+    LOG_MSG("\n-> Starting loop %d at %s UTC, having slept since %s UTC (%d second(s) ago).\n", r.numLoops,
             Time.timeStr().c_str(), Time.timeStr(r.powerSaveTime).c_str(), Time.now() - r.powerSaveTime);
 
     // If we are in slow operation override the stats timer period
@@ -2112,7 +2115,7 @@ void loop() {
                             LOG_MSG("Keeping modem awake while sleeping as we had a lot of records queued this time.\n");
                         }
                         
-                        atLeastOneGpsReportSent = sendQueuedReports();
+                        atLeastOneGpsReportSent = sendQueuedReports() & fixAchieved;
                         r.lastReportSeconds = Time.now(); // Do this at the end as transmission could, potentially, take some time
                     }
     
@@ -2188,14 +2191,19 @@ void loop() {
     }
     
     // Print a load of informational stuff
-    LOG_MSG("Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d second(s).\n",
+    LOG_MSG("-> Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d second(s).\n",
              r.numLoops, r.sleepForSeconds,
              Time.timeStr(Time.now() + r.sleepForSeconds).c_str(), r.minSleepPeriodSeconds);
-    LOG_MSG("The modem will be ");
+    LOG_MSG("-> The modem will ");
     if (r.modemStaysAwake) {
-        LOG_MSG("left awake if awake");
+        LOG_MSG("be unaffected by sleep");
+        if (Cellular.connecting()) {
+            LOG_MSG(" (it is currently CONNECTING)");
+        } else if (Cellular.ready()) {
+            LOG_MSG(" (it is currently CONNECTED)");
+        }
     } else {
-        LOG_MSG("OFF");
+        LOG_MSG("be OFF");
     }
     LOG_MSG(", GPS will be ");
     if (gpsIsOn()) {
@@ -2209,7 +2217,7 @@ void loop() {
     } else {
         LOG_MSG("will NOT");
     }
-    LOG_MSG(" wake on movement.\n");
+    LOG_MSG(" wake-up on movement.\n");
 
     // Make sure the debug LED is off to save power
     debugInd(DEBUG_IND_OFF);
