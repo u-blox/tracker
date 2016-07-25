@@ -143,14 +143,14 @@
 
 /// Define this to force a development build, which sends
 // stats and initiates "working day" operation straight away.
-#define DEV_BUILD
+//#define DEV_BUILD
 
 /// Define this to do GPS readings irrespective of the state of the
 // accelerometer.
 //#define DISABLE_ACCELEROMETER
 
 /// Define this if using the USB port for debugging.
-#define USB_DEBUG
+//#define USB_DEBUG
 
 /// Define this if a 2D GPS fix is sufficient.
 #define GPS_FIX_2D
@@ -172,7 +172,7 @@
 #ifdef DEV_BUILD
 # define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
+# define START_TIME_UNIX_UTC 14693400004// 24th July 2016 @ 06:00 UTC
 #endif
 
 /// The start time for full working day operation (in Unix, UTC).
@@ -181,9 +181,9 @@
 // This time must be later than or equal to START_TIME_UNIX_UTC.
 // Use http://www.onlineconversion.com/unix_time.htm to work this out.
 #ifdef DEV_BUILD
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469599200 // 27th July 2016 @ 06:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #endif
 
 /// The version string of this software (an incrementing integer)
@@ -1493,14 +1493,12 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
                               secondsSinceMidnight;
             if (numIntervalsPassed >= SLOW_OPERATION_NUM_WAKEUPS_PER_WORKING_DAY) {
                 sleepForSeconds = (3600 * 24) - secondsSinceMidnight + START_OF_WORKING_DAY_SECONDS + SLOW_MODE_INTERVAL_SECONDS;
+                LOG_MSG("  Next \"slow mode\" wake-up is tomorrow.\n");
             }
             LOG_MSG("  Next \"slow mode\" wake-up set to %d second(s).\n", sleepForSeconds);
             if (Time.now() + sleepForSeconds >= START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
                 sleepForSeconds = START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC - Time.now();
                 LOG_MSG("  But by that time we would be in full working day operation, so sleeping for %d second(s) instead.\n", sleepForSeconds);
-            } else if (secondsSinceMidnight + sleepForSeconds > START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS) {
-                    sleepForSeconds = secondsInDayToWorkingDayStart(secondsSinceMidnight);
-                    LOG_MSG("  But that would be after the end of the working day, so sleeping for %d second(s) instead.\n", sleepForSeconds);
             }
         }
     }
@@ -1941,6 +1939,7 @@ void setup() {
     if (!r.warmStart) {
         // Configure the accelerometer as we've not done it before
         if (accelerometer.configure()) {
+            LOG_MSG("Configuring accelerometer...\n");
             accelerometer.setActivityThreshold(ACCELEROMETER_ACTIVITY_THRESHOLD);
         }
     } else {
