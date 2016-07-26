@@ -143,14 +143,14 @@
 
 /// Define this to force a development build, which sends
 // stats and initiates "working day" operation straight away.
-//#define DEV_BUILD
+#define DEV_BUILD
 
 /// Define this to do GPS readings irrespective of the state of the
 // accelerometer.
 //#define DISABLE_ACCELEROMETER
 
 /// Define this if using the USB port for debugging.
-//#define USB_DEBUG
+#define USB_DEBUG
 
 /// Define this if a 2D GPS fix is sufficient.
 #define GPS_FIX_2D
@@ -172,7 +172,7 @@
 #ifdef DEV_BUILD
 # define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_UNIX_UTC 14693400004// 24th July 2016 @ 06:00 UTC
+# define START_TIME_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
 #endif
 
 /// The start time for full working day operation (in Unix, UTC).
@@ -183,11 +183,11 @@
 #ifdef DEV_BUILD
 # define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469685600 // 28th July 2016 @ 06:00 UTC
 #endif
 
 /// The version string of this software (an incrementing integer)
-#define SW_VERSION 3
+#define SW_VERSION 4
 
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
@@ -196,6 +196,7 @@
 /// How long to wait for things to sort themselves out on the
 // USB port after waking up from sleep.
 #ifdef USB_DEBUG
+
 // NOTE: be careful if you change this, search below for
 // #defines whose value is related
 # define WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS 5
@@ -230,15 +231,19 @@
 #define MIN_SLEEP_PERIOD_SECONDS 5
 
 /// The periodicity of telemetry reports.
-#define TELEMETRY_PERIOD_SECONDS (3600 * 8)
+#ifdef DEV_BUILD
+# define TELEMETRY_PERIOD_SECONDS (3600 * 2)
+#else
+# define TELEMETRY_PERIOD_SECONDS (3600 * 8)
+#endif
 
 /// The periodicity of stats reports.
-# define STATS_PERIOD_SECONDS TELEMETRY_PERIOD_SECONDS
+#define STATS_PERIOD_SECONDS TELEMETRY_PERIOD_SECONDS
 
 /// The report period in seconds.  At this interval the
 // queued-up records are sent (though they may be sent
 // earlier if QUEUE_SEND_LEN is reached).
-# define REPORT_PERIOD_SECONDS (60 * 10)
+#define REPORT_PERIOD_SECONDS (60 * 10)
 
 /// The queue length at which to begin sending records.
 #define QUEUE_SEND_LEN 4
@@ -272,7 +277,7 @@
 #define MODEM_POWER_ON_DELAY_MILLISECONDS 1000
 
 /// The accelerometer activity threshold (in units of 62.5 mg).
-#define ACCELEROMETER_ACTIVITY_THRESHOLD 10
+#define ACCELEROMETER_ACTIVITY_THRESHOLD 3
 
 /// The maximum time to wait for a GPS fix
 #define GPS_MAX_ON_TIME_SECONDS (60 * 3)
@@ -374,6 +379,9 @@ typedef struct {
     // Something to use as a key so that we know whether 
     // retained memory has been initialised or not
     char key[sizeof(RETAINED_INITIALISED)];
+    // The SW version that this retained memory was written
+    // from
+    uint32_t swVersion;
     // Set this to true to indicate that we don't need to
     // re-do the initialisation
     bool warmStart;
@@ -582,6 +590,7 @@ static void resetRetained() {
     LOG_MSG("Resetting retained memory to defaults.\n");
     memset (&r, 0, sizeof (r));
     strcpy (r.key, RETAINED_INITIALISED);
+    r.swVersion = SW_VERSION;
     debugInd(DEBUG_IND_RETAINED_RESET);
 }
 
@@ -1885,7 +1894,7 @@ void setup() {
     delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
 
     // Set up retained memory, if required
-    if (strcmp (r.key, RETAINED_INITIALISED) != 0) {
+    if ((strcmp (r.key, RETAINED_INITIALISED) != 0) || (r.swVersion != SW_VERSION)) {
         resetRetained();
     }
     
