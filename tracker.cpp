@@ -2211,9 +2211,11 @@ void loop() {
         r.modemStaysAwake = true;
     } // END else condition of if() time has been established
 
-    // Catch stupid sleep times
-    r.sleepForSeconds = sleepLimitsCheck(r.sleepForSeconds);
-    
+    // Catch negative sleep times
+    if (r.sleepForSeconds < 0) {
+        r.sleepForSeconds = 0;
+    }
+
     // Print a load of informational stuff
     LOG_MSG("-> Ending loop %ld: now sleeping for up to %ld second(s) (will awake at %s UTC), with a minimum of %d second(s).\n",
              r.numLoops, r.sleepForSeconds,
