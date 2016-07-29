@@ -1922,13 +1922,15 @@ static bool sendQueuedReports(bool *pAtLeastOneGpsReportSent) {
                 LOG_MSG("Incremented nextPubRecord to %d.\n", r.nextPubRecord);
             }
         } else {
-            // This must be a record which was sent previously (but we
-            // did not increment the publish record index as there had been
-            // a failure); increment the publish index now so as not to
-            // fall behind.
-            r.nextPubRecord = incModRecords(r.nextPubRecord);
-            LOG_MSG("unused.\n");
-            LOG_MSG("Incremented nextPubRecord to %d.\n", r.nextPubRecord);
+            if (failedCount == 0) {
+                // This must be a record which we attemped to send previously but
+                // we did not increment the publish record index as there had been
+                // a failure; if we've had no transmit failures we can increment
+                // the publish record index now so as not to fall behind.
+                r.nextPubRecord = incModRecords(r.nextPubRecord);
+                LOG_MSG("unused.\n");
+                LOG_MSG("Incremented nextPubRecord to %d.\n", r.nextPubRecord);
+            }
         }
 
         // Increment x
