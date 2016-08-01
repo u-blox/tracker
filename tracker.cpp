@@ -158,6 +158,9 @@
 /// Define this to skip doing anything with the cellular connection.
 //#define DISABLE_CELLULAR_CONNECTION
 
+/// Define this to send stats at each GPS attempt
+#define ENABLE_SEND_STATS_AT_GPS_ATTEMPT
+
 /****************************************************************
  * CONFIGURATION MACROS
  ***************************************************************/
@@ -186,8 +189,8 @@
 # define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469707200 // 28th July 2016 @ 012:00 UTC
 #endif
 
-/// The version string of this software (an incrementing integer)
-#define SW_VERSION 6
+/// The version string of this software (an incrementing integer).
+#define SW_VERSION 8
 
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
@@ -241,7 +244,11 @@
 #define REPORT_PERIOD_SECONDS (60 * 10)
 
 /// The queue length at which to begin sending records.
-#define QUEUE_SEND_LEN 4
+#ifdef ENABLE_SEND_STATS_AT_GPS_ATTEMPT
+# define QUEUE_SEND_LEN 8
+#else 
+# define QUEUE_SEND_LEN 4
+#endif
 
 /// The size of a record.
 #define LEN_RECORD 120
@@ -360,9 +367,47 @@ typedef enum {
     DEBUG_IND_GPS_FIX,
     DEBUG_IND_ACTIVITY,
     DEBUG_IND_RETAINED_RESET,
+    DEBUG_IND_REALLY_RETAINED_RESET,
     DEBUG_IND_BOOT_COMPLETE,
     MAX_NUM_DEBUG_INDS
 } DebugInd_t;
+
+/// Enum used to do some minimal logging over
+// time that can be stored in our tiny retained RAM.
+// This is used for bit-masking into a 32-bit wide
+// value.
+// NOTE: if you add an item to here, don't forget to
+// add it to logFlagsAsString() also.
+typedef enum {
+    LOG_FLAG_TIME_ESTABLISHED_VIA_NETWORK                 = 0x00000001,
+    LOG_FLAG_TIME_ESTABLISHED_VIA_GPS                     = 0x00000002,
+    LOG_FLAG_TIME_ESTABLISHED_VIA_RTC                     = 0x00000004,
+    LOG_FLAG_TIME_NOT_ESTABLISHED                         = 0x00000008,
+    LOG_FLAG_MOTION_DETECTED                              = 0x00000010,
+    LOG_FLAG_START_TIME_PASSED                            = 0x00000020,
+    LOG_FLAG_START_TIME_FULL_WORKING_DAY_OPERATION_PASSED = 0x00000040,
+    LOG_FLAG_IN_WORKING_DAY                               = 0x00000080,
+    LOG_FLAG_TELEMETRY_RECORD_QUEUED                      = 0x00000100,
+    LOG_FLAG_STATS_RECORD_QUEUED                          = 0x00000200,
+    LOG_FLAG_GPS_RECORD_QUEUED                            = 0x00004000,
+    LOG_FLAG_SEND_ATTEMPTED                               = 0x00008000,
+    LOG_FLAG_PUBLISH_SUCCEEDED                            = 0x00010000,
+    LOG_FLAG_CONNECT_FAILED                               = 0x00020000,
+    LOG_FLAG_PUBLISH_FAILED                               = 0x00040000,
+    LOG_FLAG_MODEM_CONNECTED                              = 0x00080000,
+    LOG_FLAG_GPS_ON_NOT_OFF                               = 0x00100000,
+    LOG_FLAG_GPS_FIX_ACHIEVED                             = 0x00200000,
+    LOG_FLAG_GPS_FIX_FAILED                               = 0x00400000,
+    LOG_FLAG_WAKE_ON_INTERRUPT                            = 0x00800000,
+    LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP                    = 0x01000000,
+    LOG_FLAG_WOKEN_UP_EARLY                               = 0x02000000,
+    LOG_FLAG_STARTUP_WARM_NOT_COLD                        = 0x04000000,
+    LOG_FLAG_FREE_1                                       = 0x08000000,
+    LOG_FLAG_FREE_2                                       = 0x10000000,
+    LOG_FLAG_FREE_3                                       = 0x20000000,
+    LOG_FLAG_FREE_4                                       = 0x40000000,
+    LOG_FLAG_STARTUP_NOT_LOOP_ENTRY                       = 0x80000000
+} LogFlag_t;
 
 /// The stuff that is stored in retained RAM.
 // NOTE: the variables that follow are retained so that
@@ -372,6 +417,10 @@ typedef enum {
 // a single memset().
 // NOTE: if you add anything to here then you should modify
 // the debug function debugPrintRetained() also.
+// NOTE: if you add or remove anything in this structure
+// you should increment SW_VERSION to be sure that retained
+// memory is reset when a device that has just loaded with
+// the new software boots, otherwise you risk reading garbage.
 typedef struct {
     // Something to use as a key so that we know whether 
     // retained memory has been initialised or not
@@ -407,7 +456,7 @@ typedef struct {
     // Whether we've asked for a GPS fix or not
     bool gpsFixRequested;
     // The records accumulated
-    Record_t records[23];
+    Record_t records[22];
     // The next free record
     uint32_t nextFreeRecord;
     // The next record to send
@@ -448,10 +497,30 @@ typedef struct {
     uint32_t numStarts;
     // Hold the last accelerometer reading
     AccelerometerReading_t accelerometerReading;
+} Retained_t;
+
+/// A log flag entry
+typedef struct {
+    time_t timestamp;
+    uint32_t flags;
+} LogFlagsEntry_t;
+
+/// This stuff is also stored in retained RAM, but
+// needs to be reset separately from the above
+typedef struct {
+    // Something to use as a key so that we know whether 
+    // retained memory has been initialised or not
+    char key[sizeof(RETAINED_INITIALISED)];
+    // The SW version that this retained memory was written
+    // from
+    uint32_t swVersion;
     // Storage for fatals
     uint32_t numFatals;
     FatalType_t fatalList[20];
-} Retained_t;
+    // Storage for "log flag" bytes
+    uint8_t numLogFlagsEntries;
+    LogFlagsEntry_t logFlagsEntries[20];
+} ReallyRetained_t;
 
 /****************************************************************
  * GLOBAL VARIABLES
@@ -480,8 +549,12 @@ uint32_t gpsPeakCNUsed = 0;
 // used for navigation the last time there were any.
 uint32_t gpsAverageCNUsed = 0;
 
-/// All the retained variables.
+/// All the normal retained variables.
 retained Retained_t r;
+
+/// A set of retained variables which is reset separately
+// from the normal set.
+retained ReallyRetained_t rr;
 
 /// A general purpose buffer, used for sending
 // and receiving UBX commands to/from the GPS module.
@@ -514,7 +587,9 @@ STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
  ***************************************************************/
 
 /// Macros to invoke asserts/fatals.
-#define FATAL(fatalType) {if (r.numFatals < (sizeof (r.fatalList) / sizeof (r.fatalList[0]))) {r.fatalList[r.numFatals] = fatalType;} r.numFatals++; System.reset();}
+// NOTE: the FATAL macro also resets retained RAM (but not "really retained"
+// RAM), as it could be something in there that has caused the assert.
+#define FATAL(fatalType) {if (rr.numFatals < (sizeof (rr.fatalList) / sizeof (rr.fatalList[0]))) {rr.fatalList[rr.numFatals] = fatalType;} rr.numFatals++; resetRetained(); System.reset();}
 #define ASSERT(condition, fatalType) {if (!(condition)) {FATAL(fatalType)}}
 
 #ifdef USB_DEBUG
@@ -530,8 +605,12 @@ STARTUP(System.enableFeature(FEATURE_RETAINED_MEMORY));
 static uint32_t littleEndianUint32(uint8_t *pByte);
 static bool handleInterrupt();
 static void debugInd(DebugInd_t debugInd);
-static void printHex(const char *pBytes, uint32_t lenBytes);
+static void printHex(const uint8_t *pBytes, uint32_t lenBytes);
 static void debugPrintRetained();
+static void addLogFlagsEntry();
+static void setLogFlag(uint32_t flag);
+static void clearLogFlag(uint32_t flag);
+static char * logFlagsAsString(uint32_t flags);
 static int32_t sendUbx(uint8_t msgClass, uint8_t msgId, const void * pBuf, uint32_t msgLen, bool checkAck);
 static uint32_t readGpsMsg (uint8_t *pBuffer, uint32_t bufferLen, uint32_t waitMilliseconds);
 static bool configureGps();
@@ -540,6 +619,7 @@ static bool gpsSetTime(time_t unixTimeUtc);
 static bool gpsGetTime(time_t *pUnixTimeUtc);
 static bool gpsCanPowerSave();
 static void resetRetained();
+static void resetReallyRetained();
 static time_t gpsOn();
 static bool gpsOff();
 static bool gpsIsOn();
@@ -578,13 +658,22 @@ static uint32_t littleEndianUint32(uint8_t *pByte) {
     return  retValue;
 }
 
-/// Reset the retained variables.
+/// Reset the normally retained variables.
 static void resetRetained() {
     LOG_MSG("Resetting retained memory to defaults.\n");
     memset (&r, 0, sizeof (r));
     strcpy (r.key, RETAINED_INITIALISED);
     r.swVersion = SW_VERSION;
     debugInd(DEBUG_IND_RETAINED_RESET);
+}
+
+/// Reset the separate set of "really retained" variables.
+static void resetReallyRetained() {
+    LOG_MSG("Resetting really retained memory to defaults.\n");
+    memset (&rr, 0, sizeof (rr));
+    strcpy (rr.key, RETAINED_INITIALISED);
+    rr.swVersion = SW_VERSION;
+    debugInd(DEBUG_IND_REALLY_RETAINED_RESET);
 }
 
 /// Handle the accelerometer interrupt, returning true if activity
@@ -636,6 +725,19 @@ static void debugInd(DebugInd_t debugInd) {
         break;
         case DEBUG_IND_RETAINED_RESET:
             // One long flash
+            digitalWrite(D7, LOW);
+            delay (25);
+            digitalWrite(D7, HIGH);
+            delay (500);
+            digitalWrite(D7, LOW);
+            delay (25);
+        break;
+        case DEBUG_IND_REALLY_RETAINED_RESET:
+            // Two long flashes
+            digitalWrite(D7, LOW);
+            delay (25);
+            digitalWrite(D7, HIGH);
+            delay (500);
             digitalWrite(D7, LOW);
             delay (25);
             digitalWrite(D7, HIGH);
@@ -731,9 +833,9 @@ static void debugPrintRetained() {
 
     for (x = 0; x < sizeof (r.records) / sizeof (r.records[0]); x++) {
         if (r.records[x].isUsed) {
-            LOG_MSG("    %02d: type %d, contents \"%s\".\n", x, r.records[x].type, r.records[x].contents);
+            LOG_MSG("    %02d: type %d, contents \"%s\".\n", x + 1, r.records[x].type, r.records[x].contents);
         } else {
-            LOG_MSG("    %02d: empty.\n", x);
+            LOG_MSG("    %02d: empty.\n", x + 1);
         }
     }
 
@@ -754,11 +856,152 @@ static void debugPrintRetained() {
     LOG_MSG ("  numConnectFailed: %u.\n", r.numConnectFailed);
     LOG_MSG ("  numStarts: %u.\n", r.numStarts);
     LOG_MSG ("  accelerometerReading: x %d, y %d, z %d.\n", r.accelerometerReading.x, r.accelerometerReading.y, r.accelerometerReading.z);
-    LOG_MSG ("  numFatals: %d (", r.numFatals);
-    for (x = 0; x < sizeof (r.fatalList) / sizeof (r.fatalList[0]); x++) {
-        LOG_MSG ("%02d-", r.fatalList[x]);
+    LOG_MSG ("  numFatals: %d (", rr.numFatals);
+    for (x = 0; x < sizeof (rr.fatalList) / sizeof (rr.fatalList[0]); x++) {
+        LOG_MSG ("%02d-", rr.fatalList[x]);
     }
     LOG_MSG (").\n");
+    LOG_MSG ("  numLogFlagsEntries: %d.\n", rr.numLogFlagsEntries);
+    for (x = 0; x < rr.numLogFlagsEntries; x++) {
+        LOG_MSG ("%02d:  %s - ", x + 1, Time.timeStr(rr.logFlagsEntries[x].timestamp).c_str());
+        logFlagsAsString(rr.logFlagsEntries[x].flags);
+    }
+}
+
+/// Start a new entry in the log flags.
+static void addLogFlagsEntry() {
+    int32_t x;
+    
+    // Increment the count
+    rr.numLogFlagsEntries++;
+    if (rr.numLogFlagsEntries > sizeof (rr.logFlagsEntries) / sizeof (rr.logFlagsEntries[0])) {
+        rr.numLogFlagsEntries = sizeof (rr.logFlagsEntries) / sizeof (rr.logFlagsEntries[0]);
+        // Shuffle the entries down
+        for (x = 1; x < rr.numLogFlagsEntries; x++) {
+            rr.logFlagsEntries[x - 1].flags = rr.logFlagsEntries[x].flags;
+            rr.logFlagsEntries[x - 1].timestamp = rr.logFlagsEntries[x].timestamp;
+        }
+    }
+    
+    // Set up the new one
+    rr.logFlagsEntries[rr.numLogFlagsEntries - 1].flags = 0;
+    rr.logFlagsEntries[rr.numLogFlagsEntries - 1].timestamp = Time.now();
+    
+}
+
+// Set a log flag in the current log flags entry
+static void setLogFlag(uint32_t flag) {
+    if (rr.numLogFlagsEntries > 0) {
+        rr.logFlagsEntries[rr.numLogFlagsEntries - 1].flags |= flag;
+    }
+}
+
+// Clear a log flag in the current log flags entry
+static void clearLogFlag(uint32_t flag) {
+    if (rr.numLogFlagsEntries > 0) {
+        rr.logFlagsEntries[rr.numLogFlagsEntries - 1].flags &= ~flag;
+    }
+}
+
+// Return a string describing a set of log flags
+static char * logFlagsAsString(uint32_t flags) {
+
+    if (flags & LOG_FLAG_STARTUP_NOT_LOOP_ENTRY)     {
+        LOG_MSG("Startup: ");
+        if (flags & LOG_FLAG_STARTUP_WARM_NOT_COLD) {
+            LOG_MSG("warm start, ");
+        } else {
+            LOG_MSG("cold start, ");
+        }
+    } else {
+        LOG_MSG("Loop: ");
+    }
+    if (flags & LOG_FLAG_TIME_ESTABLISHED_VIA_RTC)     {
+        LOG_MSG("time from RTC, ");
+    }
+    if (flags & LOG_FLAG_TIME_ESTABLISHED_VIA_NETWORK)     {
+        LOG_MSG("time from network, ");
+    }
+    if (flags & LOG_FLAG_TIME_ESTABLISHED_VIA_GPS)     {
+        LOG_MSG("time from GPS, ");
+    }
+    if (flags & LOG_FLAG_TIME_NOT_ESTABLISHED)     {
+        LOG_MSG("time not established, ");
+    }
+    if (flags & LOG_FLAG_START_TIME_PASSED)     {
+        LOG_MSG("start time passed, ");
+    }
+    if (flags & LOG_FLAG_START_TIME_FULL_WORKING_DAY_OPERATION_PASSED)     {
+        LOG_MSG("in full-working day operation, ");
+    }
+    if (flags & LOG_FLAG_IN_WORKING_DAY)     {
+        LOG_MSG("during the working day, ");
+    }
+    if (flags & LOG_FLAG_MOTION_DETECTED)     {
+        LOG_MSG("motion detected, ");
+    }
+    if (flags & LOG_FLAG_WOKEN_UP_EARLY)     {
+        LOG_MSG("awoke early, ");
+    }
+    if (flags & LOG_FLAG_TELEMETRY_RECORD_QUEUED)     {
+        LOG_MSG("telemetry queued, ");
+    }
+    if (flags & LOG_FLAG_STATS_RECORD_QUEUED)     {
+        LOG_MSG("stats queued, ");
+    }
+    if (flags & LOG_FLAG_GPS_FIX_ACHIEVED)     {
+        LOG_MSG("GPS fix, ");
+    }
+    if (flags & LOG_FLAG_GPS_FIX_FAILED)     {
+        LOG_MSG("no GPS fix, ");
+    }
+    if (flags & LOG_FLAG_GPS_RECORD_QUEUED)     {
+        LOG_MSG("GPS queued, ");
+    }
+    if (flags & LOG_FLAG_SEND_ATTEMPTED)     {
+        LOG_MSG("send attempted, ");
+    }
+    if (flags & LOG_FLAG_MODEM_CONNECTED)     {
+        LOG_MSG("modem connected, ");
+    }
+    if (flags & LOG_FLAG_CONNECT_FAILED)     {
+        LOG_MSG("connect failed, ");
+    }
+    if (flags & LOG_FLAG_PUBLISH_SUCCEEDED)     {
+        LOG_MSG("publish succeeded, ");
+    }
+    if (flags & LOG_FLAG_PUBLISH_FAILED)     {
+        LOG_MSG("publish failed, ");
+    }
+    if (flags & LOG_FLAG_GPS_ON_NOT_OFF)     {
+        LOG_MSG("GPS on at the end, ");
+    } else {
+        LOG_MSG("GPS off at the end, ");
+    }
+    if (flags & LOG_FLAG_WAKE_ON_INTERRUPT)     {
+        LOG_MSG("will wake on interrupt, ");
+    }
+    // Don't print this for a startup entry as it is irrelevant
+    if (!(flags & LOG_FLAG_STARTUP_NOT_LOOP_ENTRY)) {
+        if (flags & LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP)     {
+            LOG_MSG("using deep sleep, ");
+        } else {
+            LOG_MSG("using clock-stop sleep, ");
+        }
+    }
+    if (flags & LOG_FLAG_FREE_1)     {
+        LOG_MSG("FREE_1, ");
+    }
+    if (flags & LOG_FLAG_FREE_2)     {
+        LOG_MSG("FREE_2, ");
+    }
+    if (flags & LOG_FLAG_FREE_3)     {
+        LOG_MSG("FREE_3, ");
+    }
+    if (flags & LOG_FLAG_FREE_4)     {
+        LOG_MSG("FREE_4, ");
+    }
+    LOG_MSG("END.\n");
 }
 
 /****************************************************************
@@ -1261,6 +1504,7 @@ static time_t gpsOn() {
         digitalWrite(D2, LOW);
         r.gpsOn = true;
         LOG_MSG("VCC applied to GPS.\n");
+        setLogFlag(LOG_FLAG_GPS_ON_NOT_OFF);
         delay (GPS_POWER_ON_DELAY_MILLISECONDS);
     }
 
@@ -1283,6 +1527,7 @@ static bool gpsOff() {
         digitalWrite(D2, HIGH);
         r.gpsOn = false;
         LOG_MSG("VCC removed from GPS.\n");
+        clearLogFlag(LOG_FLAG_GPS_ON_NOT_OFF);
     }
     
     return true;
@@ -1332,6 +1577,7 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
     if (fixAchieved){
         LOG_MSG("Fix achieved in %d second(s): latitude: %.6f, longitude: %.6f, elevation: %.3f m",
                 Time.now() - startTimeSeconds, *pLatitude, *pLongitude, *pElevation);
+        setLogFlag(LOG_FLAG_GPS_FIX_ACHIEVED);
         if (*pHdop != 0) {
             LOG_MSG(", HDOP: %.2f.\n", *pHdop);
         } else {
@@ -1365,6 +1611,8 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
                 LOG_MSG("No response.");
             }
         }
+    } else {
+        setLogFlag(LOG_FLAG_GPS_FIX_FAILED);
     }
     
     return fixAchieved;
@@ -1383,6 +1631,7 @@ static bool connect() {
 #else
     if (Particle.connected()) {
         success = true;
+        setLogFlag(LOG_FLAG_MODEM_CONNECTED);
     } else {
         r.numConnectAttempts++;
         LOG_MSG("Connecting to network (waiting for up to %d second(s))... ", WAIT_FOR_CONNECTION_SECONDS);
@@ -1390,7 +1639,9 @@ static bool connect() {
         if (waitFor(Particle.connected, WAIT_FOR_CONNECTION_SECONDS)) {
             success = true;
             LOG_MSG("Connected.\n");
+            setLogFlag(LOG_FLAG_MODEM_CONNECTED);
         } else {
+            setLogFlag(LOG_FLAG_CONNECT_FAILED);
             r.numConnectFailed++;
             LOG_MSG("WARNING: connection failed.\n");
         }
@@ -1419,6 +1670,7 @@ static bool isLeapYear(uint32_t year) {
 
 /// Make sure we have time sync.
 static bool establishTime() {
+    bool getNetworkTime = false;
     bool success = false;
     time_t gpsTime = 0;
 
@@ -1426,17 +1678,24 @@ static bool establishTime() {
         if (gpsGetTime(&gpsTime) && (gpsTime > MIN_TIME_UNIX_UTC)) {
             LOG_MSG("Time.now() reported as %s UTC, using GPS time (%s) instead...\n", Time.timeStr().c_str(), Time.timeStr(gpsTime).c_str());
             Time.setTime(gpsTime);
+            setLogFlag(LOG_FLAG_TIME_ESTABLISHED_VIA_GPS);
         } else {
             LOG_MSG("Time.now() reported as %s UTC and no GPS time, syncing time with network (this will take %d second(s)).\n", Time.timeStr().c_str(), TIME_SYNC_WAIT_SECONDS);
+            getNetworkTime = true;
             connect();
             Particle.syncTime();
             // The above is an asynchronous call and so we've no alternative, if we want
             // to be sure that time is correct, then to hang around for a bit and see
             delay(TIME_SYNC_WAIT_SECONDS * 1000);
         }
+    } else {
+        setLogFlag(LOG_FLAG_TIME_ESTABLISHED_VIA_RTC);
     }
     
     if (Time.now() > MIN_TIME_UNIX_UTC) {
+        if (getNetworkTime) {
+            setLogFlag(LOG_FLAG_TIME_ESTABLISHED_VIA_NETWORK);
+        }
         success = true;
         if (r.lastColdStartSeconds <= MIN_TIME_UNIX_UTC) {
             // If we didn't already have time established when we left setup(),
@@ -1445,6 +1704,7 @@ static bool establishTime() {
         }
     } else {
         LOG_MSG("WARNING: unable to establish time (time now is %d).\n", Time.now());
+        setLogFlag(LOG_FLAG_TIME_NOT_ESTABLISHED);
     }
 
     return success;
@@ -1721,6 +1981,7 @@ static void queueTelemetryReport() {
     }
     
     LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    setLogFlag(LOG_FLAG_TELEMETRY_RECORD_QUEUED);
 }
 
 /// Queue a GPS report.
@@ -1768,6 +2029,7 @@ static void queueGpsReport(float latitude, float longitude, bool motion, float h
     }
 
     LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    setLogFlag(LOG_FLAG_GPS_RECORD_QUEUED);
 }
 
 /// Queue a stats report.
@@ -1790,9 +2052,9 @@ static void queueStatsReport() {
 
     // Add fatal count and types
     if ((contentsIndex > 0) && (contentsIndex < LEN_RECORD)) {
-        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";F%ld", r.numFatals); // -1 for terminator
-        for (uint8_t x = 0; (x < r.numFatals) && (x < (sizeof (r.fatalList) / sizeof (r.fatalList[0]))); x++) {
-            contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ".%02d", r.fatalList[x]); // -1 for terminator
+        contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ";F%ld", rr.numFatals); // -1 for terminator
+        for (uint8_t x = 0; (x < rr.numFatals) && (x < (sizeof (rr.fatalList) / sizeof (rr.fatalList[0]))); x++) {
+            contentsIndex += snprintf (pRecord + contentsIndex, LEN_RECORD - contentsIndex - 1, ".%02d", rr.fatalList[x]); // -1 for terminator
         }
     }
     if ((contentsIndex < 0) || (contentsIndex >= LEN_RECORD)) {
@@ -1868,6 +2130,7 @@ static void queueStatsReport() {
     }
     
     LOG_MSG("%d byte(s) of record used (%d byte(s) unused).\n", contentsIndex + 1, LEN_RECORD - (contentsIndex + 1)); // +1 to account for terminator
+    setLogFlag(LOG_FLAG_STATS_RECORD_QUEUED);
 }
 
 /// Send the queued reports, returning true if all have been sent.
@@ -1901,12 +2164,14 @@ static bool sendQueuedReports(bool *pAtLeastOneGpsReportSent) {
                     }
                     freeRecord(&r.records[x]);
                     sentCount++;
+                    setLogFlag(LOG_FLAG_PUBLISH_SUCCEEDED);
                     // In the Particle code only four publish operations can be performed per second,
                     // so put in a 1 second delay every four
                     if (sentCount % 4 == 0) {
                         delay (1000);
                     }
                 } else {
+                    setLogFlag(LOG_FLAG_PUBLISH_FAILED);
                     r.numPublishFailed++;
                     failedCount++;
                     LOG_MSG("WARNING: send failed.\n");
@@ -1935,6 +2200,8 @@ static bool sendQueuedReports(bool *pAtLeastOneGpsReportSent) {
 
         // Increment x
         x = incModRecords(x);
+        
+        setLogFlag(LOG_FLAG_SEND_ATTEMPTED);
     }
 
     LOG_MSG("%ld report(s) sent, %ld failed to send.\n", sentCount, failedCount);
@@ -1950,6 +2217,7 @@ static bool sendQueuedReports(bool *pAtLeastOneGpsReportSent) {
         *pAtLeastOneGpsReportSent = atLeastOneGpsReportSent;
     }
 
+    setLogFlag(LOG_FLAG_TELEMETRY_RECORD_QUEUED);
     return failedCount == 0;
 }
 
@@ -1967,15 +2235,24 @@ void setup() {
 
     debugPrintRetained();
     
-    // Set up retained memory, if required
+    // Set up retained and "really retained" memory, if required
     if ((strcmp (r.key, RETAINED_INITIALISED) != 0) || (r.swVersion != SW_VERSION)) {
         resetRetained();
     }
+    if ((strcmp (rr.key, RETAINED_INITIALISED) != 0) || (rr.swVersion != SW_VERSION)) {
+        resetReallyRetained();
+    }
+    
+    // Add a log flag for starting up
+    addLogFlagsEntry();
+    setLogFlag(LOG_FLAG_STARTUP_NOT_LOOP_ENTRY);
     
     if (r.warmStart) {
         LOG_MSG("\n-> Start-up after deep sleep.\n");
+        setLogFlag(LOG_FLAG_STARTUP_WARM_NOT_COLD);
     } else {
         LOG_MSG("\n-> Start-up from power-off.\n");
+        clearLogFlag(LOG_FLAG_STARTUP_WARM_NOT_COLD);
     }
     
     // Starting again
@@ -2008,6 +2285,7 @@ void setup() {
     Serial1.blockOnOverrun(true);
     pinMode(D2, OUTPUT);
     LOG_MSG("VCC applied to GPS module during setup.\n");
+    setLogFlag(LOG_FLAG_GPS_ON_NOT_OFF);
     digitalWrite(D2, LOW);
     delay(GPS_POWER_ON_DELAY_MILLISECONDS);
 
@@ -2048,6 +2326,7 @@ void setup() {
     if (!r.gpsOn) {
         digitalWrite(D2, HIGH);
         LOG_MSG("VCC removed from GPS module at end of setup.\n");
+        clearLogFlag(LOG_FLAG_GPS_ON_NOT_OFF);
     } else {
         LOG_MSG("Leaving GPS on as it was on before we started.\n");
     }
@@ -2087,6 +2366,10 @@ void loop() {
     // Wait for USB to sort itself out
     delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
     
+    // Add a new log flag entry for this loop
+    addLogFlagsEntry();
+    clearLogFlag(LOG_FLAG_STARTUP_NOT_LOOP_ENTRY);
+    
     // This only for info
     r.numLoops++;
     LOG_MSG("\n-> Starting loop %d at %s UTC, having been power saving since %s UTC (%d second(s) ago).\n", r.numLoops,
@@ -2100,6 +2383,8 @@ void loop() {
     if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
         statsPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
         r.gpsFixRequested = true;
+    } else {
+        setLogFlag(LOG_FLAG_START_TIME_FULL_WORKING_DAY_OPERATION_PASSED);
     }
 
     // Having valid time is fundamental to this program and so, if time
@@ -2123,11 +2408,18 @@ void loop() {
         if (Time.now() >= START_TIME_UNIX_UTC) {
             uint32_t secondsSinceMidnight = Time.hour() * 3600 + Time.minute() * 60 + Time.second();
 
+            setLogFlag(LOG_FLAG_START_TIME_PASSED);
+            
             // Check if we are inside the working day
             if ((secondsSinceMidnight >= START_OF_WORKING_DAY_SECONDS) &&
                 (secondsSinceMidnight <= START_OF_WORKING_DAY_SECONDS + LENGTH_OF_WORKING_DAY_SECONDS)) {
                     
                 LOG_MSG("It is during the working day.\n");
+                setLogFlag(LOG_FLAG_IN_WORKING_DAY);
+
+                // During the working day we respond to interrupts
+                wakeOnAccelerometer = true;
+                setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
 
                 // See if we've moved
                 inMotion = handleInterrupt();
@@ -2136,6 +2428,7 @@ void loop() {
                     r.lastMotionSeconds = Time.now();
                     r.numLoopsMotionDetected++;
                     LOG_MSG("*** Motion was detected.\n");
+                    setLogFlag(LOG_FLAG_MOTION_DETECTED);
                 }
 
                 // First of all, check if this is a wake-up from a previous sleep
@@ -2146,10 +2439,6 @@ void loop() {
                     r.sleepForSeconds = MIN_MOTION_PERIOD_SECONDS;
                     r.minSleepPeriodSeconds = MIN_MOTION_PERIOD_SECONDS;
                     r.modemStaysAwake = false;
-
-                    // During the working day and if we've not been awoken early, we
-                    // respond to interrupts
-                    wakeOnAccelerometer = true;
 
                     // Queue a telemetry report, if required
                     if (Time.now() - r.lastTelemetrySeconds >= TELEMETRY_PERIOD_SECONDS) {
@@ -2183,6 +2472,9 @@ void loop() {
                         r.numLoopsGpsOn++;
                         // Get the latest output from GPS
                         fixAchieved = gpsUpdate(&latitude, &longitude, &elevation, &hdop);
+#ifdef ENABLE_SEND_STATS_AT_GPS_ATTEMPT
+                        queueStatsReport();
+#endif
                         if (fixAchieved) {
                             r.numLoopsGpsFix++;
                             r.numLoopsLocationValid++;
@@ -2223,7 +2515,7 @@ void loop() {
                     // If we're in slow-mode, haven't sent a GPS report yet and are still within
                     // the time-window then stay awake, otherwise shut the modem and GPS down
                     if (Time.now() < START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
-                        if (!(atLeastOneGpsReportSent && fixAchieved) && (Time.now() - r.lastColdStartSeconds <= SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
+                       if (!(atLeastOneGpsReportSent && fixAchieved) && (Time.now() - r.lastColdStartSeconds <= SLOW_OPERATION_MAX_TIME_TO_GPS_FIX_SECONDS)) {
                             r.modemStaysAwake = true;
                             LOG_MSG("Keeping modem awake while sleeping as we're in the short \"slow mode\" wake-up.\n");
                         } else {
@@ -2242,7 +2534,8 @@ void loop() {
                 } else { // END if() we've woken up early
                     // If we have awoken early, put us back to sleep again for the remaining sleep time
                     r.sleepForSeconds = r.minSleepPeriodSeconds - (Time.now() - r.sleepStartSeconds);
-                    LOG_MSG("Interrupt woke us up early, going back to bed with interrupts off this time.\n");
+                    LOG_MSG("Interrupt woke us up early, going back to bed again.\n");
+                    setLogFlag(LOG_FLAG_WOKEN_UP_EARLY);
                 } // END else condition of if() we've woken up early
 
                 // Make sure we don't set a wacky sleep period during the working day
@@ -2263,8 +2556,9 @@ void loop() {
         } else { // END if() time >= START_TIME_UNIX_UTC
             LOG_MSG("Awake before start time (time now %s UTC, start time %s UTC).\n", 
                     Time.timeStr().c_str(), Time.timeStr(START_TIME_UNIX_UTC).c_str());
-            // Clear the retained variables as we'd like a fresh start when we awake
+            // Clear the retained and "really retained" variables as we'd like a fresh start when we awake
             resetRetained();
+            resetReallyRetained();
 
             // We're awake when we shouldn't have started operation at all yet, calculate new wake-up time
             r.sleepForSeconds = START_TIME_UNIX_UTC - Time.now();
@@ -2291,6 +2585,7 @@ void loop() {
         // time, does not succeed and so keeping the accelerometer on as an additional source
         // of wake-up is good belt and braces
         wakeOnAccelerometer = true;
+        setLogFlag(LOG_FLAG_TIME_NOT_ESTABLISHED);
     } // END else condition of if() time has been established
 
     // Catch odd sleep times
@@ -2315,16 +2610,20 @@ void loop() {
              r.numLoops, r.sleepForSeconds,
              Time.timeStr(Time.now() + r.sleepForSeconds).c_str(), r.minSleepPeriodSeconds);
     LOG_MSG("-> The modem will ");
+    setLogFlag(LOG_FLAG_FREE_1);
     if (r.modemStaysAwake) {
         LOG_MSG("be unaffected by sleep");
         if (Cellular.connecting()) {
+            setLogFlag(LOG_FLAG_FREE_2);
             LOG_MSG(" (it is currently CONNECTING)");
         } else if (Cellular.ready()) {
+            setLogFlag(LOG_FLAG_FREE_3);
             LOG_MSG(" (it is currently CONNECTED)");
         }
     } else {
         LOG_MSG("be OFF");
     }
+    setLogFlag(LOG_FLAG_FREE_4);
     LOG_MSG(", GPS will be ");
     if (gpsIsOn()) {
         LOG_MSG("ON");
@@ -2366,6 +2665,7 @@ void loop() {
         if (r.modemStaysAwake) {
             // Sleep with the network connection up so that we can send reports
             // without having to re-register
+            clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
             System.sleep(WKP, RISING, r.sleepForSeconds, SLEEP_NETWORK_STANDBY);
             // TODO maybe call this:
             // Particle.process();
@@ -2373,6 +2673,7 @@ void loop() {
             // Otherwise we can go to deep sleep and will re-register when we awake
             // NOTE: we will come back from reset after this, only the
             // retained variables will be kept
+            setLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
             System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
         }
     }
