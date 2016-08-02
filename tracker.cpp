@@ -2372,7 +2372,7 @@ void loop() {
     
     // This only for info
     r.numLoops++;
-    LOG_MSG("\n-> Starting loop %d at %s UTC, having been power saving since %s UTC (%d second(s) ago).\n", r.numLoops,
+    LOG_MSG("\n-> Starting loop %d at %s UTC, having power saved since %s UTC (%d second(s) ago).\n", r.numLoops,
             Time.timeStr().c_str(), Time.timeStr(r.powerSaveTime).c_str(), Time.now() - r.powerSaveTime);
 
     // If we are in slow operation override the stats timer period
@@ -2613,15 +2613,15 @@ void loop() {
     setLogFlag(LOG_FLAG_FREE_1);
     if (r.modemStaysAwake) {
         LOG_MSG("be unaffected by sleep");
-        if (Cellular.connecting()) {
-            setLogFlag(LOG_FLAG_FREE_2);
-            LOG_MSG(" (it is currently CONNECTING)");
-        } else if (Cellular.ready()) {
-            setLogFlag(LOG_FLAG_FREE_3);
-            LOG_MSG(" (it is currently CONNECTED)");
-        }
     } else {
         LOG_MSG("be OFF");
+    }
+    if (Cellular.connecting()) {
+        setLogFlag(LOG_FLAG_FREE_2);
+        LOG_MSG(" (it is currently CONNECTING)");
+    } else if (Cellular.ready()) {
+        setLogFlag(LOG_FLAG_FREE_3);
+        LOG_MSG(" (it is currently CONNECTED)");
     }
     setLogFlag(LOG_FLAG_FREE_4);
     LOG_MSG(", GPS will be ");
@@ -2673,6 +2673,10 @@ void loop() {
             // Otherwise we can go to deep sleep and will re-register when we awake
             // NOTE: we will come back from reset after this, only the
             // retained variables will be kept
+            // NOTE: explicitly switch cellular off first as, if you do not, the system
+            // often dies entirely (not even returning on the accelerometer interrupt)
+            // once in deep sleep.
+            Cellular.off();
             setLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
             System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
         }
