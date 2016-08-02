@@ -143,7 +143,7 @@
 
 /// Define this to force a development build, which sends
 // stats and initiates "working day" operation straight away.
-#define DEV_BUILD
+//#define DEV_BUILD
 
 /// Define this to do GPS readings irrespective of the state of the
 // accelerometer.
@@ -190,7 +190,7 @@
 #endif
 
 /// The version string of this software (an incrementing integer).
-#define SW_VERSION 8
+#define SW_VERSION 7
 
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
@@ -2364,7 +2364,7 @@ void loop() {
     float hdop = GPS_INVALID_HDOP;
 
     // Wait for USB to sort itself out
-    delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
+    delay(WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
     
     // Add a new log flag entry for this loop
     addLogFlagsEntry();
@@ -2525,6 +2525,7 @@ void loop() {
                             gpsOff();
                             r.modemStaysAwake = false;
                             wakeOnAccelerometer = false;
+                            clearLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
                         }
                     }
 
@@ -2585,6 +2586,7 @@ void loop() {
         // time, does not succeed and so keeping the accelerometer on as an additional source
         // of wake-up is good belt and braces
         wakeOnAccelerometer = true;
+        setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
         setLogFlag(LOG_FLAG_TIME_NOT_ESTABLISHED);
     } // END else condition of if() time has been established
 
@@ -2643,7 +2645,7 @@ void loop() {
     
 #ifdef USB_DEBUG
     // Leave a little time for serial prints to leave the building before sleepy-byes
-    delay (1000);
+    delay(1000);
 #endif
     
     // Now go to sleep for the allotted time.
@@ -2667,18 +2669,25 @@ void loop() {
             // without having to re-register
             clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
             System.sleep(WKP, RISING, r.sleepForSeconds, SLEEP_NETWORK_STANDBY);
-            // TODO maybe call this:
-            // Particle.process();
         } else {
             // Otherwise we can go to deep sleep and will re-register when we awake
             // NOTE: we will come back from reset after this, only the
             // retained variables will be kept
-            // NOTE: explicitly switch cellular off first as, if you do not, the system
-            // often dies entirely (not even returning on the accelerometer interrupt)
-            // once in deep sleep.
+            // NOTE: the following code is a workaround for the issue where an RTC alarm
+            // can end up being in the past if the modem is awake and doesn't shut down
+            // immediately.  See issue report https://github.com/spark/firmware/issues/1075.
+            Cellular.disconnect();
             Cellular.off();
-            setLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
-            System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
+            while (Cellular.ready() && (r.sleepForSeconds > 0)) {
+                delay(1000);
+                r.sleepForSeconds--;
+            }
+            if (r.sleepForSeconds > 0) {
+                setLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
+                System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
+            } else {
+                r.sleepForSeconds = 0;
+            }
         }
     }
 }
