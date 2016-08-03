@@ -194,7 +194,7 @@
 
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
-#define WAIT_FOR_CONNECTION_SECONDS 120
+#define WAIT_FOR_CONNECTION_SECONDS 180
 
 /// How long to wait for things to sort themselves out on the
 // USB port after waking up from sleep.
@@ -282,7 +282,7 @@
 #define ACCELEROMETER_ACTIVITY_THRESHOLD 3
 
 /// The maximum time to wait for a GPS fix
-#define GPS_MAX_ON_TIME_SECONDS (60 * 5)
+#define GPS_MAX_ON_TIME_SECONDS (60 * 10)
 
 /// GPS module power on delay.
 #define GPS_POWER_ON_DELAY_MILLISECONDS 500
@@ -1325,7 +1325,6 @@ static bool gpsGetTime(time_t *pUnixTimeUtc) {
     uint32_t x;
     bool switchGpsOffAgain = !gpsIsOn();
 
-
     // Make sure GPS is on
     gpsOn();
     
@@ -1735,7 +1734,7 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
     if (Time.now() >= START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC) {
         // Begin by setting the sleep time to the longest possible time
         sleepForSeconds = TELEMETRY_PERIOD_SECONDS;
-        LOG_MSG("In full working day operation, setting next wake-up in %d seconds.\n", sleepForSeconds);
+        LOG_MSG("In full working day operation, setting next wake-up in %d second(s).\n", sleepForSeconds);
         
         // Check if we're doing a GPS fix (after motion was triggered)
         if (gpsIsOn()) {
@@ -1786,7 +1785,7 @@ static time_t setTimings(uint32_t secondsSinceMidnight, bool atLeastOneGpsReport
         
         // Make sure that the minSleepPeriodSeconds doesn't prevent us waking up for one of the above
         if (sleepForSeconds < minSleepPeriodSeconds) {
-            LOG_MSG("  Min sleep time, %d, is less than the sleep time we want, setting min sleep time to %d second(s).\n", minSleepPeriodSeconds, sleepForSeconds);
+            LOG_MSG("  Min sleep time, %d, is greater than the sleep time we want, setting min sleep time to %d second(s).\n", minSleepPeriodSeconds, sleepForSeconds);
             minSleepPeriodSeconds = sleepForSeconds;
         }
     } else {
@@ -2187,13 +2186,13 @@ static bool sendQueuedReports(bool *pAtLeastOneGpsReportSent) {
                 LOG_MSG("Incremented nextPubRecord to %d.\n", r.nextPubRecord);
             }
         } else {
+            LOG_MSG("unused.\n");
             if (failedCount == 0) {
                 // This must be a record which we attemped to send previously but
                 // we did not increment the publish record index as there had been
                 // a failure; if we've had no transmit failures we can increment
                 // the publish record index now so as not to fall behind.
                 r.nextPubRecord = incModRecords(r.nextPubRecord);
-                LOG_MSG("unused.\n");
                 LOG_MSG("Incremented nextPubRecord to %d.\n", r.nextPubRecord);
             }
         }
@@ -2233,6 +2232,7 @@ void setup() {
     // delay if you're going to capture the serial output completely
     delay (WAIT_FOR_WAKEUP_TO_SETTLE_SECONDS * 1000);
 
+    LOG_MSG("\n-> Starting up.\n");
     debugPrintRetained();
     
     // Set up retained and "really retained" memory, if required
@@ -2370,6 +2370,12 @@ void loop() {
     addLogFlagsEntry();
     clearLogFlag(LOG_FLAG_STARTUP_NOT_LOOP_ENTRY);
     
+    // Set the GPS log flag (as otherwise it won't be
+    // set unless GPS is toggled on this loop)
+    if (gpsIsOn()) {
+        setLogFlag(LOG_FLAG_GPS_ON_NOT_OFF);
+    }
+    
     // This only for info
     r.numLoops++;
     LOG_MSG("\n-> Starting loop %d at %s UTC, having power saved since %s UTC (%d second(s) ago).\n", r.numLoops,
@@ -2417,7 +2423,7 @@ void loop() {
                 LOG_MSG("It is during the working day.\n");
                 setLogFlag(LOG_FLAG_IN_WORKING_DAY);
 
-                // During the working day we respond to interrupts
+                // Respond to interrupts
                 wakeOnAccelerometer = true;
                 setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
 
@@ -2472,9 +2478,6 @@ void loop() {
                         r.numLoopsGpsOn++;
                         // Get the latest output from GPS
                         fixAchieved = gpsUpdate(&latitude, &longitude, &elevation, &hdop);
-#ifdef ENABLE_SEND_STATS_AT_GPS_ATTEMPT
-                        queueStatsReport();
-#endif
                         if (fixAchieved) {
                             r.numLoopsGpsFix++;
                             r.numLoopsLocationValid++;
@@ -2488,6 +2491,14 @@ void loop() {
                         gpsOff();
                     }
     
+#ifdef ENABLE_SEND_STATS_AT_GPS_ATTEMPT
+                    // If a fix was requested, and now that we have the GPS stats (which were
+                    // populated in the gpsCanPowerSave() call), queue a stats report with
+                    // the data in.
+                    if (r.gpsFixRequested) {
+                        queueStatsReport();
+                    }
+#endif
                     // Check if it's time to publish the queued reports
                     if (forceSend || ((Time.now() - r.lastReportSeconds >= REPORT_PERIOD_SECONDS) || (r.numRecordsQueued >= QUEUE_SEND_LEN))) {
                         if (forceSend) {
@@ -2501,15 +2512,6 @@ void loop() {
                         
                         sendFailure = !sendQueuedReports(&atLeastOneGpsReportSent);
                         r.lastReportSeconds = Time.now(); // Do this at the end as transmission could, potentially, take some time
-                        
-                        // If GPS is on and we had a send failure, keep the modem on. This is partly because we will very likely
-                        // be sending something soon and partly because we have seen the System.Sleep(SLEEP_MODE_DEEP) call fail
-                        // to wake us up at the designated time and maybe the stop-mode sleep (which we have used successfully in
-                        // the past) will not suffer from the same problem
-                        if (gpsIsOn() && sendFailure) {
-                            r.modemStaysAwake = true;
-                            LOG_MSG("Keeping modem awake while sleeping as GPS is on and we had a send failure on the last occasion.\n");
-                        }
                     }
     
                     // If we're in slow-mode, haven't sent a GPS report yet and are still within
@@ -2581,12 +2583,6 @@ void loop() {
         gpsOff();
         // Keep the modem awake in this case as we will want to establish network time
         r.modemStaysAwake = true;
-        // Strictly speaking this is unnecessary: we have a timer running, we should wake
-        // up and retry.  However, we have seen cases where either the wake-up, or establishing
-        // time, does not succeed and so keeping the accelerometer on as an additional source
-        // of wake-up is good belt and braces
-        wakeOnAccelerometer = true;
-        setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
         setLogFlag(LOG_FLAG_TIME_NOT_ESTABLISHED);
     } // END else condition of if() time has been established
 
