@@ -192,6 +192,10 @@
 /// The version string of this software (an incrementing integer).
 #define SW_VERSION 7
 
+/// The minimum time for which we go to deep sleep.  If the sleep time
+// is less than this we will use clock-stop sleep instead
+#define MINIMUM_DEEP_SLEEP_PERIOD_SECONDS 600
+
 /// The maximum amount of time to hang around waiting for a
 // connection to the Particle server.
 #define WAIT_FOR_CONNECTION_SECONDS 180
@@ -1556,20 +1560,7 @@ static bool gpsUpdate(float *pLatitude, float *pLongitude, float *pElevation, fl
         fixAchieved = gotGpsFix(pLatitude, pLongitude, pElevation, pHdop);
         // Sleep while we're waiting
         if (!fixAchieved) {
-#ifdef USB_DEBUG
-            // If we need the USB to be up there is no time to go to sleep
             delay (GPS_CHECK_INTERVAL_SECONDS * 1000);
-#else
-            // Otherwise, go to clock-stop sleep, keeping the modem up, and making sure that
-            // we don't wake-up early due to accelerometer activity
-            if (accelerometerConnected) {
-                accelerometer.disableInterrupts();
-            }
-            System.sleep(WKP, RISING, GPS_CHECK_INTERVAL_SECONDS, SLEEP_NETWORK_STANDBY);
-            if (accelerometerConnected) {
-                accelerometer.enableInterrupts();
-            }
-#endif
         }
     }
 
@@ -2425,7 +2416,6 @@ void loop() {
 
                 // Respond to interrupts
                 wakeOnAccelerometer = true;
-                setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
 
                 // See if we've moved
                 inMotion = handleInterrupt();
@@ -2527,7 +2517,6 @@ void loop() {
                             gpsOff();
                             r.modemStaysAwake = false;
                             wakeOnAccelerometer = false;
-                            clearLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
                         }
                     }
 
@@ -2652,15 +2641,17 @@ void loop() {
         if (accelerometerConnected) {
             if (wakeOnAccelerometer) {
                 accelerometer.enableInterrupts();
-            } else {
+                setLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
+           } else {
                 accelerometer.disableInterrupts();
+                clearLogFlag(LOG_FLAG_WAKE_ON_INTERRUPT);
             }
         }
         
         // The system calls here will wake up when the WKP pin rises due to the
         // accelerometer interrupt going off (even the call that doesn't explicitly
         // mention that pin).
-        if (r.modemStaysAwake) {
+        if (r.modemStaysAwake || (r.sleepForSeconds < MINIMUM_DEEP_SLEEP_PERIOD_SECONDS)) {
             // Sleep with the network connection up so that we can send reports
             // without having to re-register
             clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
@@ -2674,15 +2665,16 @@ void loop() {
             // immediately.  See issue report https://github.com/spark/firmware/issues/1075.
             Cellular.disconnect();
             Cellular.off();
-            while (Cellular.ready() && (r.sleepForSeconds > 0)) {
+            while (Cellular.ready() && (r.sleepForSeconds > MINIMUM_DEEP_SLEEP_PERIOD_SECONDS)) {
                 delay(1000);
                 r.sleepForSeconds--;
             }
-            if (r.sleepForSeconds > 0) {
+            if (r.sleepForSeconds > MINIMUM_DEEP_SLEEP_PERIOD_SECONDS) {
                 setLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
                 System.sleep(SLEEP_MODE_DEEP, r.sleepForSeconds);
             } else {
-                r.sleepForSeconds = 0;
+                clearLogFlag(LOG_FLAG_DEEP_SLEEP_NOT_CLOCK_STOP);
+                System.sleep(WKP, RISING, r.sleepForSeconds, SLEEP_NETWORK_STANDBY);
             }
         }
     }
