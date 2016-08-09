@@ -175,7 +175,7 @@
 #ifdef DEV_BUILD
 # define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_UNIX_UTC 1469707200 // 28th July 2016 @ 12:00 UTC
+# define START_TIME_UNIX_UTC 1470909600 // 11th August 2016 @ 12:00 UTC
 #endif
 
 /// The start time for full working day operation (in Unix, UTC).
@@ -186,7 +186,7 @@
 #ifdef DEV_BUILD
 # define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469707200 // 28th July 2016 @ 012:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1470909600 // 11th August 2016 @ 12:00 UTC
 #endif
 
 /// The version string of this software (an incrementing integer).
