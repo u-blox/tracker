@@ -1,18 +1,17 @@
 /*
  * Copyright (C) u-blox, author: Rob Meades (rob.meades@u-blox.com)
  * 
- * All rights reserved. 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  * 
- * Permission to use, copy, modify, and distribute this software for any 
- * purpose without fee is hereby granted, provided that this entire notice 
- * is included in all copies of any software which is or includes a copy 
- * or modification of this software and in all copies of the supporting 
- * documentation for such software. 
+ * http://www.apache.org/licenses/LICENSE-2.0
  * 
- * THIS SOFTWARE IS BEING PROVIDED "AS IS", WITHOUT ANY EXPRESS OR IMPLIED 
- * WARRANTY. IN PARTICULAR, NEITHER THE AUTHOR NOR U-BLOX MAKES ANY 
- * REPRESENTATION OR WARRANTY OF ANY KIND CONCERNING THE MERCHANTABILITY 
- * OF THIS SOFTWARE OR ITS FITNESS FOR ANY PARTICULAR PURPOSE. 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "application.h"
