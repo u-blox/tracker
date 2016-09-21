@@ -191,7 +191,7 @@
 #ifdef DEV_BUILD
 # define START_TIME_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_UNIX_UTC 1470909600 // 11th August 2016 @ 12:00 UTC
+# define START_TIME_UNIX_UTC 1473933600 // 15th September 2016 @ 12:00 UTC
 #endif
 
 /// The start time for full working day operation (in Unix, UTC).
@@ -202,11 +202,11 @@
 #ifdef DEV_BUILD
 # define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1469340000 // 24th July 2016 @ 06:00 UTC
 #else
-# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1470909600 // 11th August 2016 @ 12:00 UTC
+# define START_TIME_FULL_WORKING_DAY_OPERATION_UNIX_UTC 1473933600 // 15th September 2016 @ 12:00 UTC
 #endif
 
 /// The version string of this software (an incrementing integer).
-#define SW_VERSION 7
+#define SW_VERSION 8
 
 /// The minimum time for which we go to deep sleep.  If the sleep time
 // is less than this we will use clock-stop sleep instead
@@ -330,6 +330,9 @@
 
 /// Something to use as an invalid HDOP.
 #define GPS_INVALID_HDOP 999999999
+
+/// Amount of time considered as being in motion after an initial accelerometer motion
+#define IN_MOTION_TIME_SECONDS (60 * 10)
 
 /***************************************************************
  * OTHER MACROS
@@ -473,6 +476,8 @@ typedef struct {
     time_t lastMotionSeconds;
     // The time of the last cold start
     time_t lastColdStartSeconds;
+    // The last time the accelerometer got a nudge
+    time_t lastAccelerometerNudge;
     // Whether we've asked for a GPS fix or not
     bool gpsFixRequested;
     // The records accumulated
@@ -1888,6 +1893,11 @@ static time_t sleepLimitsCheck(time_t sleepForSeconds) {
     return sleepForSeconds;
 }
 
+/// check if we are still in motion by checking how long it has been since the last accelerometer nudge
+static bool stillWithinMotionDelaySinceLastAcceleration(time_t lastAccelerometerNudge, time_t Timenow) {
+    return (Timenow <= (lastAccelerometerNudge + IN_MOTION_TIME_SECONDS));
+}
+
 /****************************************************************
  * STATIC FUNCTIONS: REPORTS
  ***************************************************************/
@@ -2363,6 +2373,8 @@ void loop() {
     bool wakeOnAccelerometer = false;
     bool atLeastOneGpsReportSent = false;
     bool inMotion = false;
+    bool accelerationDetected = false;
+    bool stillInMotion = false;
     bool fixAchieved = false;
     bool sendFailure = false;
     float latitude = GPS_INVALID_ANGLE;
@@ -2434,13 +2446,20 @@ void loop() {
                 wakeOnAccelerometer = true;
 
                 // See if we've moved
-                inMotion = handleInterrupt();
+                accelerationDetected = handleInterrupt();
+                stillInMotion = stillWithinMotionDelaySinceLastAcceleration(r.lastAccelerometerNudge, Time.now());
+                inMotion = (accelerationDetected || stillInMotion);
                 if (inMotion) {
-                    r.gpsFixRequested = true;
-                    r.lastMotionSeconds = Time.now();
-                    r.numLoopsMotionDetected++;
-                    LOG_MSG("*** Motion was detected.\n");
-                    setLogFlag(LOG_FLAG_MOTION_DETECTED);
+                  r.gpsFixRequested = true;
+                  r.lastMotionSeconds = Time.now();
+                  if (accelerationDetected) {
+                    r.lastAccelerometerNudge = r.lastMotionSeconds;
+                    LOG_MSG("*** Acceleration was detected.\n");
+                  } else {
+                    LOG_MSG("*** Motion was detected based on time.\n");
+                  }
+                  r.numLoopsMotionDetected++;
+                  setLogFlag(LOG_FLAG_MOTION_DETECTED);
                 }
 
                 // First of all, check if this is a wake-up from a previous sleep
@@ -2493,7 +2512,7 @@ void loop() {
                     }
     
                     // If GPS meets the power-save criteria, switch it off
-                    if (gpsIsOn() && gpsCanPowerSave()) {
+                    if (!inMotion && gpsIsOn() && gpsCanPowerSave()) {
                         gpsOff();
                     }
     
